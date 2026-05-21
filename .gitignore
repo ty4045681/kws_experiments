@@ -16,3 +16,5 @@ runs/*/metrics.json
 
 # OS
 .DS_Store
+
+.claude
