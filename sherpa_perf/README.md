@@ -1,92 +1,301 @@
-# sherpa_perf —— sherpa-onnx KWS 推理性能测试
+# sherpa_perf — sherpa-onnx KWS 推理性能测试
 
-测三类东西:
-
-| 类别  | 关注              | 用哪个 mode             |
-|-------|-------------------|-------------------------|
-| 时延  | 单条音频处理多快  | `single`                |
-| 并发  | 能稳定接住几路    | `concurrent`            |
-| 吞吐  | batch 服务上限    | `batch`                 |
-
-输出每个场景一份 JSON,直接落到上层脚手架某次实验的 `metrics/` 目录,
-被 `scripts/parse_perf.py` 收纳入库,在 `registry.csv` 和 `REPORT.md`
-里和准确率指标并排展示。
-
-## 目录
+测的是**速度与容量**（延迟分布、RTF、并发承载、批吞吐），不测准确率（那是 `sherpa_eval/` 的工作）。
+每个场景产出一份 `perf-<scene>-<backend>[-tag].json`，落入上层实验的 `metrics/`，
+由 `scripts/parse_perf.py` 收纳进 `registry.csv` 与 `REPORT.md`，与准确率指标并排展示。
 
 ```
 sherpa_perf/
 ├── README.md
-├── run.sh                      # 一键多场景
+├── run.sh                      # 多场景一键脚本
 └── sherpa_onnx_kws_perf.py     # 测试核心
 ```
 
-## 快速上手
+---
 
-```bash
-# 1. 把模型放到 sherpa_perf/model/(或在 run.sh 顶部改路径)
-# 2. 准备 manifest(可直接复用 sherpa_eval 产物)
-ls ../sherpa_eval/data/wakeword_pos.jsonl
+## 1. 模式概览
 
-# 3. 在 run.sh 顶部 SCENES 数组配置你要跑的场景,然后:
-bash run.sh
+| Mode         | 回答的问题                                    | 关键产出                                   |
+|--------------|-----------------------------------------------|--------------------------------------------|
+| `single`     | 单条音频端到端处理多久？是否能跑实时？        | `latency_seconds.{p50,p95,p99}`、`rtf.mean` |
+| `concurrent` | 并发 N 路时尾延迟还稳吗？这台机器顶几路？     | `latency_seconds.p95`、`rtf_per_stream.p95` |
+| `batch`      | 服务端批量推理，每条等效延迟与吞吐？          | `throughput_calls_per_sec`、`batch_rtf`     |
 
-# 4. 产出:
-ls ../runs/exp001_baseline/metrics/perf-*.json
+设计原则：**真实部署里每路通常是独立解码状态机**，所以 `concurrent` 给每个 worker 独立 `KeywordSpotter`；
+`batch` 模式要利用 sherpa-onnx 的 `decode_streams([...])` 批解码 API，必须共享同一个 spotter。
+
+---
+
+## 2. 关键指标定义
+
+### 2.1 端到端延迟 `latency_seconds`
+
+**计时边界**：`decode_one_blocking` 内 `t0 = perf_counter()`（line 173）到 `return perf_counter() - t0`（line 191）之间的 wall-clock。
+
+**计入**：
+- 主循环：所有 chunk 的 `accept_waveform` → `decode_stream` → `get_result` → 命中时的 `reset_stream`
+- 尾部静音（`_tail_padding`，0.66s）的喂入与解码
+- `input_finished()` 后的 drain 循环
+
+**不计入**：
+- `build_spotter` 模型加载（启动阶段一次性开销）
+- WAV 解码与文件 I/O（`_preload_pool` 在计时前完成）
+- warmup 调用（默认 2 次，结果丢弃；line 225-227 / 300-302）
+
+**KWS 特异点**：脚本测的是"整条音频跑完"的延迟，**不是"keyword 命中即结束"的延迟**。命中后 `reset_stream` 继续监听，所以即便 keyword 出现在 1.2s 处，wall 仍包含剩余 ~1.8s + tail 的处理。这是有意设计——测稳态推理开销，避免命中位置造成的方差。如需测 "wake-to-response" 延迟，应另外实现：`get_result` 命中即 break，单独统计。
+
+**百分位选择**：mean 会被长尾掩盖，统一汇报分位数：
+
+| 字段  | 工程含义                                                    |
+|-------|-------------------------------------------------------------|
+| `p50` | 典型体验。一半请求快于此值。                                |
+| `p90` | 容量规划用。                                                |
+| `p95` | **SLO 主指标**。常作为是否可上线的硬门槛。                  |
+| `p99` | 高可用服务必看；体现 GC / 抢占 / 线程切换造成的尾噪。       |
+| `max` | 最坏个例，用于诊断 cold-start 或异常长样本。                |
+
+注：`run_concurrent` 的 `rtf_per_stream` 不汇报 `p99` / `max`（line 341 的 `with_p99=False, with_max=False`），并发尾噪由 `latency_seconds.p99` 承担即可。
+
+### 2.2 实时因子 RTF
+
+```
+RTF = wall_seconds / audio_seconds
 ```
 
-## 三种模式
+| RTF        | 含义                                                          |
+|------------|---------------------------------------------------------------|
+| `< 1`      | 比实时快，能跟住麦克风流。健康 KWS 通常应 `< 0.3`。           |
+| `≈ 1`      | 刚好跟上，无 headroom，并发场景几乎必然掉队。                 |
+| `> 1`      | 处理慢于输入；流式缓冲单调增长，最终会 OOM 或丢音。           |
 
-### `single` — 单流时延 / RTF
+**`pacing` 与 RTF**：`realtime` 下 wall 包含 sleep 时间，所以 `rtf_per_stream ≈ 1 + 算力开销 / 音频时长`。这就是为何 realtime 下 `rtf_per_stream.p95 > 1.3` 是危险信号——sleep 都压不住算力开销，缓冲在涨。
 
-单线程顺序处理 N 条音频,统计每条端到端 wall-clock 时间。
-输出:延迟分布(P50/P90/P95/P99)、RTF(实时倍速)、平均吞吐。
+### 2.3 xRT — `throughput_audio_per_wall`
 
-```bash
-python sherpa_onnx_kws_perf.py \
-    --tokens model/tokens.txt --encoder ... --decoder ... --joiner ... \
-    --keywords-file model/keywords.txt \
-    --manifest ../sherpa_eval/data/wakeword_pos.jsonl \
-    --mode single --limit 50 --num-threads 1 \
-    --scene single_cpu1t --output-dir ../runs/exp001_baseline/metrics
+```
+xRT = audio_seconds_total / wall_seconds
 ```
 
-适合回答:"一条 3 秒的录音从送入到拿到 trigger 要多久?"
+直译："1 秒墙钟能消化多少秒音频"，也称**等效实时倍速**。与单流 RTF 的关系：
 
-### `concurrent` — 多路并发
+| 模式         | 关系                                                          |
+|--------------|---------------------------------------------------------------|
+| `single`     | `xRT ≈ 1 / rtf.mean`（顺序无并行，纯算力倒数视角）            |
+| `concurrent` | `xRT ≈ N × (1 / rtf_per_stream)`，**理论上限 = 并发路数 N**   |
+| `batch`      | `xRT ≈ 1 / batch_rtf`，B 条流的并行加速已折进 batch_rtf       |
 
-启 N 个工作线程,每个线程**独立** `KeywordSpotter` 实例(贴近真实多路部署),
-从共享音频池循环取数据,跑满 `--duration-seconds` 后停止。
+**具体数字**（沿用第 3 节的示例）：
 
-```bash
-python sherpa_onnx_kws_perf.py ... \
-    --mode concurrent --concurrency 8 --duration-seconds 30 \
-    --pacing full \
-    --scene concurrent_c8 --output-dir ...
+| 场景                       | rtf 视角            | xRT      | 解读                                           |
+|----------------------------|---------------------|----------|------------------------------------------------|
+| `single_cpu1t`             | `rtf.mean=0.027`    | 35.7     | 单流时 CPU 极空闲，硬件还有大量富余            |
+| `concurrent_c8` `realtime` | `rtf_per_stream≈1.0`| 7.9      | 每路只跑实时，总 xRT ≈ N，符合"8 路同时讲话"   |
+| `concurrent_c8` `full`     | `rtf_per_stream<1`  | 25~30    | 跑满 CPU 的真实吞吐拐点                        |
+| `batch_b8`                 | `batch_rtf=0.0026`  | 384      | batch 摊薄推理常数开销，xRT 远高于 single      |
+
+**工程意义**：xRT 是"一台机器能顶几路实时麦克风"的硬上限。部署留 20–30% buffer：`xRT_full = 25` → 上线最多开 ~18 路。
+
+### 2.4 cps — `throughput_calls_per_sec`
+
+```
+cps = n_calls_total / wall_seconds
 ```
 
-- `--pacing full`:不 sleep,跑满 CPU,看吞吐上限
-- `--pacing realtime`:按音频时长 sleep,模拟"8 个用户同时讲话",
-  这种情况下 P95 延迟代表真实部署的尾延迟
+直译："1 秒墙钟能完成多少次完整调用"。与 xRT 的换算：
 
-适合回答:"这台机器能稳定承载多少路并发,P95 还可控?"
-
-### `batch` — 批量解码
-
-使用 sherpa-onnx 的 `decode_streams([s1, ..., sB])` 批处理 API。
-每个 batch 同时创建 B 条 stream,全量喂入,然后反复批解码到收敛。
-
-```bash
-python sherpa_onnx_kws_perf.py ... \
-    --mode batch --batch-size 16 --n-batches 20 \
-    --scene batch_b16 --output-dir ...
+```
+cps ≈ xRT / 平均音频时长
 ```
 
-适合回答:"服务端 batch_size=N 时,等效每条延迟和总吞吐是多少?"
+例：`xRT = 384`、平均 3s 音频 → `cps ≈ 128`，与 `batch_b8` 实测一致。
 
-## 输出 JSON 字段说明
+**工程意义**：服务端 QPS 容量规划的核心指标。前端 QPS 需求 1000、单机 cps = 128 → 至少 8 台（未含 buffer 与故障冗余）。
 
-每份 `perf-<scene>-<backend>[-tag].json` 顶层:
+**为什么 `single` 不报 cps**：单线程顺序处理时 cps 与样本时长强耦合（同样的算力跑全 1s 样本 vs 全 5s 样本，cps 差 5 倍），意义有限；xRT 与样本时长无关，更能反映算力本身。看 `_summarize_single`（line 269）——只输出 `throughput_audio_per_wall`，没有 cps。
+
+### 2.5 三者关系速查
+
+```
+RTF (单条)   ──取倒数──→  xRT (单流)
+                              │
+                         × 并行路数(concurrent) / batch 内并行(batch)
+                              ↓
+                          xRT (聚合)   ──÷ 平均音频时长──→  cps
+```
+
+回答不同问题用不同视角：
+
+| 问题                                | 看哪个                               |
+|-------------------------------------|--------------------------------------|
+| 单条响应快不快？                    | `latency_seconds.p95`                |
+| 单条算得过来吗？（是否能跑实时）    | `rtf.mean < 1`，理想 `< 0.3`         |
+| 一台机器顶几路实时？                | `xRT_full` × 0.7~0.8（留 buffer）    |
+| 服务端单机 QPS 上限？               | `cps`（来自 `concurrent_full` 或 `batch`）|
+
+### 2.6 Pacing（`concurrent` 独有）
+
+| `--pacing`   | 行为                                                  | 用途                                         |
+|--------------|-------------------------------------------------------|----------------------------------------------|
+| `full`       | 不 sleep，连续喂                                      | 找吞吐拐点（极限容量评估）。                 |
+| `realtime`   | 每喂一 chunk `sleep(len(seg)/sr)`（line 182-183）     | 模拟 N 路真实麦克风，**P95 才有 SLO 意义**。 |
+
+容量评估用 `full`；上线验证尾延迟用 `realtime`。
+
+---
+
+## 3. 音频处理流程
+
+后续所有时间轴均以 **3s / 16 kHz / 单声道 wav，`chunk_seconds=0.5`** 为例：
+
+- `chunk = 8000 samples`（一片 0.5s）→ 主体切 **6 个 chunk**
+- 尾部 `_TAIL_SECONDS = 0.66s`（line 149）→ 再补 ~2 个 chunk，让最后一个词解码出来
+- 数字仅为示意，实际值与机器/模型相关
+
+### 3.1 共同前置
+
+```
+load_manifest()       JSONL → List[Sample]，顺手 wave.open 取时长
+        ↓
+build_spotter()       加载 tokens/encoder/decoder/joiner/keywords
+        ↓
+_preload_pool()       所有 wav 一次性 decode 为 float32 numpy；
+                      避免 I/O 进入热路径计时
+        ↓
+warmup                每个 spotter 跑 N 条（默认 2），结果丢弃
+```
+
+### 3.2 `single` 模式时间轴
+
+`run_single` (`sherpa_onnx_kws_perf.py:216-239`) 在主线程上对 pool 顺序遍历，
+每条音频走 `decode_one_blocking(pacing="full")`：
+
+```
+T = 0.000s  s = kws.create_stream()
+T = 0.000s  t0 = perf_counter()                ← 计时开始
+            ┌────────── 主循环：6 个 chunk ─────────┐
+T ≈ 0.000s  │ accept_waveform(audio[0:8000])       │
+            │ while is_ready: decode_stream;       │
+            │   get_result; 命中则 reset_stream    │
+T ≈ 0.012s  │ accept_waveform(audio[8000:16000])   │
+T ≈ 0.025s  │ ...                                  │
+T ≈ 0.064s  │ accept_waveform(audio[40000:48000])  │
+            └──────────────────────────────────────┘
+T ≈ 0.064s  accept_waveform(tail)               ← 0.66s 静音
+T ≈ 0.064s  input_finished()
+T ≈ 0.064s  drain：while is_ready: decode_stream
+T = 0.078s  return wall = perf_counter() - t0   ← 0.078s
+```
+
+记录到 `PerCallRecord(audio_seconds=3.0, wall_seconds=0.078, rtf=0.026)`。
+跑完 N 条后 `_summarize_single` (line 269) 汇总。
+
+**要点**：
+
+- 流式语义：每片喂入立刻 decode，不等积攒。
+- 命中后 `reset_stream` 不是终止，而是清状态继续监听（防止同句多次触发）。
+- `pacing="full"`，wall = 纯计算耗时。
+
+### 3.3 `concurrent` 模式时间轴
+
+`run_concurrent` (line 283-342) 拓扑：
+
+```
+主线程
+ ├─ _preload_pool()            音频池（共享只读）
+ ├─ stop_flag = Event()
+ ├─ per_thread_recs = [[]]*N   各线程独立列表，避免锁竞争
+ ├─ 启动 N 个 worker(daemon=True)
+ ├─ sleep(duration_seconds)
+ ├─ stop_flag.set()
+ └─ join 所有 worker
+```
+
+单个 worker 内（`worker`，line 298-313）；以 `--concurrency 8 --pacing realtime` 为例：
+
+```
+T = 0.0s   kws = factory()                ← 每线程独立 KeywordSpotter
+T < 1s     warmup（pacing=full，结果丢弃）
+T ≈ 1s     循环：while not stop_flag.is_set():
+           ┌────────── 一次调用 (pacing=realtime) ──────────┐
+           │ accept_waveform(chunk[0]); decode_stream       │
+           │ sleep(0.5)              ← ★ 模拟麦克风节奏     │
+           │ accept_waveform(chunk[1]); decode_stream       │
+           │ sleep(0.5)                                     │
+           │ ... 共 6 次 喂+sleep                           │
+           │ accept_waveform(tail); input_finished; drain   │
+           └────────────────────────────────────────────────┘
+           wall ≈ 3.05s（≈ 音频时长 + 计算开销）
+           记录 PerCallRecord; i += 1
+T = 30s    stop_flag 被主线程置位 → 循环退出 → 线程结束
+```
+
+8 个 worker 并行执行同一段逻辑，被各自的 `sleep` 错开 → 任意时刻都有多个 stream
+在 CPU 上推进，等价于 8 个用户同时讲话。聚合时把 8 个 thread 的 records 拼起来出统计。
+
+**`pacing` 切换的语义差异**：
+
+- `full`：wall 反映纯算力，`latency_seconds` 不再代表用户等待时间，而是 "在 N 路抢资源时这条流要多久"。容量评估用。
+- `realtime`：wall ≈ 音频时长 + 算力开销。`rtf_per_stream.p95` 是关键 SLO；
+  若 > 1.3，说明缓冲在涨，再加路就会崩。
+
+### 3.4 `batch` 模式时间轴
+
+`run_batch` (line 345-418) 单个 batch（`--batch-size 8`）三阶段：
+
+```
+T = 0.000s  阶段 A：建 stream
+            streams = [kws.create_stream() for _ in range(8)]
+
+T = 0.001s  阶段 B：全量喂入（尚未 decode）
+            for i in 0..7:
+                for chunk in audio_i: streams[i].accept_waveform(...)
+                streams[i].accept_waveform(tail)
+                streams[i].input_finished()
+
+T = 0.005s  阶段 C：批解码循环（line 375-383）
+            while True:
+                ready = [s for s in streams if kws.is_ready(s)]
+                if not ready: break
+                kws.decode_streams(ready)        ← ★ 一次 forward 跑 ready 中所有 stream
+                for s in ready:
+                    r = kws.get_result(s)
+                    if r: kws.reset_stream(s)
+            # 各 stream 可能在不同轮次提前完成,ready 集合逐步收缩
+
+T = 0.062s  return wall = 0.062, audio_total = 24.0  (8 × 3s)
+```
+
+与 `single` 的本质差异：
+
+| 维度        | `single`              | `batch`                                           |
+|-------------|-----------------------|---------------------------------------------------|
+| 喂/算节奏   | 每片立刻 decode       | 全量喂完再批解码                                  |
+| 模型调用    | `decode_stream(s)`    | `decode_streams([s1..sB])`                        |
+| 加速来源    | —                     | 矩阵并行：一次 forward 的耗时 ≪ B × 单次 forward |
+
+跑 `n_batches` 个 batch 后汇总：
+
+- `per_call_latency_seconds = batch_wall / batch_size` —— **摊销值**，不是用户等待时间。
+- 用户真实等待 = 单 batch wall + 凑齐 batch 的排队时间。
+- 因此：**端侧实时唤醒禁用 batch；服务端语音网关才用 batch。**
+
+### 3.5 三种模式音频路径对比
+
+| 阶段          | `single`                          | `concurrent` (`realtime`)                 | `batch`                                |
+|---------------|-----------------------------------|-------------------------------------------|----------------------------------------|
+| 入口          | 主线程顺序取                      | N worker 从共享只读池循环取               | 主线程为本批构造 B 条 stream           |
+| Spotter       | 1 个                              | **每线程 1 个**                           | 1 个共享                               |
+| Stream 数     | 1                                 | N（每线程 1）                             | B（同一 spotter 持有）                 |
+| 节奏          | 全速喂                            | 每片 `sleep(len/sr)`                      | 全速喂完所有条                         |
+| 算的时机      | 每片立刻 `decode_stream`          | 每片立刻 `decode_stream`                  | 全量喂入后 `decode_streams` 反复批算   |
+| 终止          | pool 跑完                         | `sleep(duration)` 到点                    | `n_batches` 跑完                       |
+| 关键 metric   | `latency.p95` / `rtf.mean`        | `latency.p95` / `rtf_per_stream.p95`      | `throughput_calls_per_sec` / `batch_rtf` |
+
+---
+
+## 4. 输出 JSON 结构
+
+文件名：`perf-<scene>-<backend>[-tag].json`。顶层：
 
 ```json
 {
@@ -95,9 +304,11 @@ python sherpa_onnx_kws_perf.py ... \
   "backend": "onnx",
   "tag": "",
   "chunk_seconds": 0.5,
+  "manifest": "../sherpa_eval/data/wakeword_pos.jsonl",
   "n_manifest_samples": 50,
   "env": {
     "platform": "Linux-...",
+    "python": "3.11.x",
     "cpu_count": 16,
     "cpu_model": "Intel(R) Xeon(R) ...",
     "provider": "cpu",
@@ -106,61 +317,123 @@ python sherpa_onnx_kws_perf.py ... \
   },
   "model": {
     "encoder": "model/encoder-....onnx",
-    "keywords_threshold": 0.35
+    "keywords_threshold": 0.35,
+    "keywords_score": null
   },
-  "result": {
-    // mode-specific 字段,见下
-  }
+  "result": { ... }   // mode-specific，见下
 }
 ```
 
-### `result` 在三种 mode 下的字段
+### `result` 字段
 
-#### single
-| 字段                              | 含义                                |
-|-----------------------------------|-------------------------------------|
-| `throughput_audio_per_wall`       | 音频秒数 / wall 秒,xRT,越大越好    |
-| `latency_seconds.{p50,p95,p99}`   | 端到端延迟分布                       |
-| `rtf.mean`                        | 平均 RTF(<1 即比实时快)             |
+#### `single`
 
-#### concurrent
-| 字段                                | 含义                                  |
-|-------------------------------------|---------------------------------------|
-| `concurrency`                       | 并发路数                              |
-| `pacing`                            | full / realtime                       |
-| `throughput_calls_per_sec`          | 每秒完成多少条调用                    |
-| `throughput_audio_per_wall`         | 总音频秒数 / wall,xRT                |
-| `latency_seconds.{p50,p95,p99}`     | 单路端到端延迟分布                    |
-| `rtf_per_stream.{mean,p95}`         | 单流 RTF(>1 表示掉队)                |
+| 字段                              | 含义                                       |
+|-----------------------------------|--------------------------------------------|
+| `n_samples`                       | 实际处理条数                               |
+| `elapsed_seconds`                 | wall 总耗时                                |
+| `audio_seconds_total`             | 音频时长合计                               |
+| `throughput_audio_per_wall`       | xRT                                        |
+| `latency_seconds.{mean,p50,p90,p95,p99,max}` | 端到端延迟分布                  |
+| `rtf.{mean,p50,p95}`              | RTF 分布                                   |
 
-#### batch
-| 字段                                | 含义                                  |
-|-------------------------------------|---------------------------------------|
-| `batch_size` / `n_batches`          | 批参数                                |
-| `throughput_calls_per_sec`          | 调用吞吐                              |
-| `batch_wall_seconds.{mean,p95}`     | 单 batch 总耗时                       |
-| `per_call_latency_seconds.{mean,p95}` | 等效每条延迟 = batch 耗时 / batch_size |
-| `batch_rtf.mean`                    | batch 音频总时长 vs wall 的比         |
+#### `concurrent`
 
-## 文件命名约定
+| 字段                                    | 含义                                          |
+|-----------------------------------------|-----------------------------------------------|
+| `concurrency` / `pacing`                | 配置                                          |
+| `duration_seconds`                      | 实际跑了多久                                  |
+| `n_calls_total` / `n_calls_per_thread_mean` | 总调用数 / 每线程均值                     |
+| `throughput_audio_per_wall`             | 等效 xRT（N 路并行，理论上限 ≈ N）            |
+| `throughput_calls_per_sec`              | 每秒完成调用数                                |
+| `latency_seconds.{mean,p50,p90,p95,p99,max}` | 单路端到端延迟分布（**SLO 主指标**）     |
+| `rtf_per_stream.{mean,p50,p95}`         | 单流 RTF；`> 1` 表示掉队                      |
 
+#### `batch`
+
+| 字段                                       | 含义                                          |
+|--------------------------------------------|-----------------------------------------------|
+| `batch_size` / `n_batches`                 | 批配置                                        |
+| `n_calls_total`                            | `batch_size × n_batches`                      |
+| `elapsed_seconds` / `audio_seconds_total`  | wall 与音频合计                               |
+| `throughput_audio_per_wall`                | xRT                                           |
+| `throughput_calls_per_sec`                 | 调用吞吐                                      |
+| `batch_wall_seconds.{mean,p50,p95,max}`    | 单 batch 耗时分布                             |
+| `per_call_latency_seconds.{mean,p50,p95}`  | 摊销延迟（**非用户等待**）                    |
+| `batch_rtf.mean`                           | 批音频总时长 / 批 wall                        |
+
+---
+
+## 5. 使用方式
+
+### 5.1 一键跑全部场景
+
+在 `run.sh` 顶部 `SCENES` 数组配置好后：
+
+```bash
+bash run.sh
 ```
-perf-<scene>-<backend>[-tag].json
+
+### 5.2 只跑某个场景
+
+```bash
+bash run.sh --only concurrent_c8
 ```
 
-- `scene`:任意名(`single_cpu1t` / `concurrent_c8` / `batch_b16` / ...)
-- `backend`:一般是 `onnx`
-- `tag`:可选,常用于区分配置变体(`-realtime` / `-int8` / ...)
+### 5.3 改输出目录或单参数
 
-上层 `scripts/parse_perf.py` 会按此模式发现并解析。
+```bash
+bash run.sh --output-dir ../runs/exp003_xxx/metrics
+bash run.sh --pacing realtime --keywords-threshold 0.30
+```
 
-## 常见问题
+### 5.4 单场景直接调 Python
 
-- **为什么 concurrent 用每线程独立 spotter,而 batch 用共享 spotter?**
-  - 真实部署里每路通常是独立的解码状态机(stream),用独立 spotter 更接近;
-  - batch 模式正是要利用 sherpa-onnx 的批解码 API,必须共享同一个 spotter。
-- **`--pacing full` vs `realtime` 该选哪个?**
-  - 容量评估(找拐点) → `full`
-  - 评估在线服务真实尾延迟 → `realtime`
-- **要不要先 warmup?**
-  - 默认 `--warmup 2`,跑两条丢弃,避免首条 cold-start 拖偏 P50。
+```bash
+# single
+python sherpa_onnx_kws_perf.py \
+    --tokens model/tokens.txt --encoder ... --decoder ... --joiner ... \
+    --keywords-file model/keywords.txt \
+    --manifest ../sherpa_eval/data/wakeword_pos.jsonl \
+    --mode single --limit 50 --num-threads 1 \
+    --scene single_cpu1t --output-dir ../runs/exp001_baseline/metrics
+
+# concurrent
+python sherpa_onnx_kws_perf.py ... \
+    --mode concurrent --concurrency 8 --duration-seconds 30 --pacing realtime \
+    --scene concurrent_c8 --output-dir ...
+
+# batch
+python sherpa_onnx_kws_perf.py ... \
+    --mode batch --batch-size 16 --n-batches 20 \
+    --scene batch_b16 --output-dir ...
+```
+
+---
+
+## 6. 决策指南
+
+| 想知道                          | 看哪个                                                              |
+|---------------------------------|---------------------------------------------------------------------|
+| 这块板子能跑实时吗              | `single_cpu1t` 的 `rtf.mean < 0.3` 较稳，`< 1` 才有可能              |
+| ORT 多线程加速比                | `single_cpu1t` vs `single_cpu4t` 的 `throughput_audio_per_wall`     |
+| 上线能开几路                    | `concurrent_cN` 扫一组，找 `latency.p95` 起拐点的 N（留 20% buffer）|
+| 服务端 batch 是否划算           | `batch_b8` vs `batch_b16` 的 `throughput_calls_per_sec` 增益是否值得 `per_call_latency` 的代价 |
+
+---
+
+## 7. 设计取舍
+
+- **`concurrent` 每线程独立 spotter，`batch` 共享 spotter**
+  - 真实多路部署每路是独立解码状态机；共享 spotter 但多 stream 与多实例的内存/缓存行为不同。
+  - `batch` 模式的加速正是要走 `decode_streams([...])`，必须共享。
+- **`_preload_pool` 把音频全量读入内存**
+  - 把 I/O 从热路径剥离；样本数过大时受 RAM 限制，用 `--limit` 控。
+- **`_tail_padding` 缓存按采样率复用**（line 149-159）
+  - 避免热路径 `np.zeros` 分配影响计时稳定性。
+- **`_summarize_single` 用 numpy percentile，concurrent 单流 RTF 不报 p99/max**
+  - 并发尾延迟的极端点不代表系统问题，看 p95 更稳健。
+- **`warmup` 默认 2 条**
+  - 跳过 ORT 首次推理的 cold-start，避免 P50 被首条拖偏；超大模型可调高。
+- **`pacing` 不影响 RTF 公式本身**
+  - RTF 永远是 `wall / audio`；但 `realtime` 下 wall 包含 sleep，所以 RTF ≈ 1 + 算力开销 / 音频时长。
