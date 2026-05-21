@@ -18,6 +18,7 @@ import argparse
 import datetime
 import re
 import shutil
+import sys
 from pathlib import Path
 
 
@@ -47,6 +48,8 @@ def main() -> None:
     ap.add_argument("--variable", default="", help="本次消融改动的变量名")
     ap.add_argument("--value", default="", help="变量取值(字符串)")
     ap.add_argument("--notes", default="", help="自由备注")
+    ap.add_argument("--print-path", action="store_true",
+                    help="只在 stdout 打印新目录的相对路径(便于 shell 捕获),其它信息走 stderr")
     args = ap.parse_args()
 
     if not TEMPLATE.exists():
@@ -76,14 +79,23 @@ def main() -> None:
         text = re.sub(pat, repl, text, count=1)
     cfg_dst.write_text(text, encoding="utf-8")
 
-    print(f"已创建 {exp_dir}")
-    print(f"  - {cfg_dst}")
-    print(f"  - {exp_dir / 'metrics'}/   <- 把 decode.py 产出的 metric-*.txt 放这里")
-    print(f"\n下一步:")
-    print(f"  1. 编辑 {cfg_dst} 填入真实超参")
-    print(f"  2. 跑训练 + decode,把 metric-<testset>-{{pt,onnx}}[-tag].txt 放到 metrics/")
-    print(f"  3. python scripts/parse_decode.py {exp_dir.relative_to(ROOT)}")
-    print(f"  4. python scripts/update_registry.py {exp_dir.relative_to(ROOT)}")
+    rel = exp_dir.relative_to(ROOT)
+    if args.print_path:
+        # stdout 只输出路径,便于 `EXP_DIR=$(new_experiment.py --print-path ...)`
+        print(rel)
+        msg_stream = sys.stderr
+    else:
+        msg_stream = sys.stdout
+        print(f"已创建 {exp_dir}", file=msg_stream)
+    print(f"  - {cfg_dst}", file=msg_stream)
+    print(f"  - {exp_dir / 'metrics'}/   <- 把 decode.py 产出的 metric-*.txt 放这里",
+          file=msg_stream)
+    print(f"\n下一步:", file=msg_stream)
+    print(f"  1. 编辑 {cfg_dst} 填入真实超参", file=msg_stream)
+    print(f"  2. 跑训练 + decode,把 metric-<testset>-{{pt,onnx}}[-tag].txt 放到 metrics/",
+          file=msg_stream)
+    print(f"  3. python scripts/parse_decode.py {rel}", file=msg_stream)
+    print(f"  4. python scripts/update_registry.py {rel}", file=msg_stream)
 
 
 if __name__ == "__main__":

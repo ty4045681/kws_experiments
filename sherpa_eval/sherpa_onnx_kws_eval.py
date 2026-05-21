@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 import wave
@@ -86,7 +87,7 @@ import numpy as np
 
 try:
     import sherpa_onnx  # type: ignore
-except ImportError as e:
+except ImportError:
     sys.stderr.write(
         "未找到 sherpa_onnx,请先安装:\n"
         "    pip install sherpa-onnx\n"
@@ -298,55 +299,47 @@ def judge(
     """返回 (TP, FP, TN, FN, hyp_str),并就地更新 metric。"""
     ref_text = ref_text.upper()
     hyp_str = " | ".join(hyp_set)
+    hyp_uniq = set(hyp_set)
+
+    def matches(x: str) -> bool:
+        return x == ref_text if test_only_keywords else x in ref_text
 
     TP = FP = False
-    for x in set(hyp_set):
+    for x in hyp_uniq:
         if x not in keywords:
-            # sherpa-onnx 触发的短语未声明在 keywords 里:计为虚警
             metric.setdefault(x, KwMetric())
             FP = True
             metric[x].FP += 1
             metric[x].FP_list.append(f"({ref_text} -> {x})")
             continue
-        if (test_only_keywords and x == ref_text) or (
-            not test_only_keywords and x in ref_text
-        ):
+        if matches(x):
             TP = True
             metric[x].TP += 1
             metric[x].TP_list.append(f"({ref_text} -> {x})")
-        if (test_only_keywords and x != ref_text) or (
-            not test_only_keywords and x not in ref_text
-        ):
+        else:
             FP = True
             metric[x].FP += 1
             metric[x].FP_list.append(f"({ref_text} -> {x})")
-    if TP: metric["all"].TP += 1
-    if FP: metric["all"].FP += 1
+    if TP:
+        metric["all"].TP += 1
+    if FP:
+        metric["all"].FP += 1
 
     TN = True
     FN = False
-    hyp_set_uniq = set(hyp_set)
     for x in keywords:
-        if x not in ref_text and x not in hyp_set_uniq:
+        if x not in ref_text and x not in hyp_uniq:
             metric[x].TN += 1
             continue
         TN = False
-        if (test_only_keywords and x == ref_text) or (
-            not test_only_keywords and x in ref_text
-        ):
-            fn = True
-            for y in hyp_set_uniq:
-                if (test_only_keywords and y == ref_text) or (
-                    not test_only_keywords and y in ref_text
-                ):
-                    fn = False
-                    break
-            if fn:
-                FN = True
-                metric[x].FN += 1
-                metric[x].FN_list.append(f"({ref_text} -> {hyp_str})")
-    if TN: metric["all"].TN += 1
-    if FN: metric["all"].FN += 1
+        if matches(x) and not any(matches(y) for y in hyp_uniq):
+            FN = True
+            metric[x].FN += 1
+            metric[x].FN_list.append(f"({ref_text} -> {hyp_str})")
+    if TN:
+        metric["all"].TN += 1
+    if FN:
+        metric["all"].FN += 1
     return TP, FP, TN, FN, hyp_str
 
 
@@ -457,7 +450,8 @@ def main() -> None:
     triggers_path = out_dir / f"triggers-{args.testset}-{args.suffix}.jsonl"
     total_audio_sec = 0.0
     total_neg_sec = 0.0  # 不含任何关键词的音频累计时长 → 用于 FA/hour
-    t0 = time.time()
+    has_any_kw = re.compile("|".join(re.escape(k) for k in keywords)).search
+    t0 = time.perf_counter()
 
     with triggers_path.open("w", encoding="utf-8") as ft:
         for i, sp in enumerate(samples, 1):
@@ -470,8 +464,7 @@ def main() -> None:
             )
             if sp.duration is not None:
                 total_audio_sec += sp.duration
-                # 负样本 = ref 不包含任何 keyword
-                if not any(k in sp.text for k in keywords):
+                if not has_any_kw(sp.text):
                     total_neg_sec += sp.duration
             ft.write(json.dumps({
                 "utt_id": sp.utt_id,
@@ -489,7 +482,7 @@ def main() -> None:
 
     # 机读摘要
     m_all = metric["all"]
-    elapsed = time.time() - t0
+    elapsed = time.perf_counter() - t0
     summary = {
         "testset": args.testset,
         "suffix": args.suffix,

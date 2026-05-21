@@ -155,34 +155,28 @@ def _per_command_rows(j: dict) -> List[Dict[str, object]]:
 
 
 def _union_keys(rows: Iterable[Dict[str, object]]) -> List[str]:
-    keys: List[str] = []
-    seen = set()
-    for r in rows:
-        for k in r.keys():
-            if k not in seen:
-                seen.add(k)
-                keys.append(k)
-    return keys
+    return list(dict.fromkeys(k for r in rows for k in r.keys()))
 
 
 def _read_csv(path: Path) -> List[Dict[str, object]]:
-    if not path.exists():
+    try:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            return list(csv.DictReader(f))
+    except FileNotFoundError:
         return []
-    with path.open("r", encoding="utf-8", newline="") as f:
-        return list(csv.DictReader(f))
 
 
 def _write_csv(path: Path, rows: List[Dict[str, object]]) -> None:
     if not rows:
-        if path.exists():
-            path.unlink()
+        # 空表保留(写一个空文件)而不是删除——避免幂等重跑时把别人的 CSV 抹了
+        path.write_text("", encoding="utf-8")
         return
     fieldnames = _union_keys(rows)
     with path.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for r in rows:
-            w.writerow({k: ("" if r.get(k) is None else r.get(k)) for k in fieldnames})
+            w.writerow({k: ("" if (v := r.get(k)) is None else v) for k in fieldnames})
 
 
 def _load_all_metrics() -> List[dict]:

@@ -2,12 +2,11 @@
 """
 从 registry.csv / per_command.csv / per_perf.csv 生成 REPORT.md。
 
-设计原则(2026-05-20 重构):
-  - 不再用 registry 的宽表做主总览(列太多、太稀疏)。
+设计原则:
   - 准确率主总览以 per_command.csv(长表)聚合,每行只展示真有数据的格子。
   - 每个 testset 单独出一张"实验 × backend/tag"小表,自动剪掉全空列。
   - backend 形如 `onnx-tXX` 视为"阈值扫描" tag,自动抽出来出阈值小节。
-  - 性能(perf)章节维持原样:总览 / 最佳 / 详细。
+  - 性能(perf)章节:总览 / 最佳 / 详细。
 
 用法:
     python scripts/build_report.py
@@ -17,8 +16,9 @@ from __future__ import annotations
 
 import csv
 import datetime
+import math
 import re
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -30,6 +30,7 @@ PER_PERF = ROOT / "per_perf.csv"
 OUT = ROOT / "REPORT.md"
 
 _PERF_NDIGITS = 3
+_TAG_T_RE = re.compile(r"^t(.+)$")
 
 
 # ─── 通用工具 ───────────────────────────────────────────────────────────
@@ -42,11 +43,11 @@ def _read_csv(path: Path) -> List[Dict[str, str]]:
 
 
 def _fmt(v: Any, ndigits: int = 3) -> str:
-    if v is None or v == "" or (isinstance(v, float) and v != v):  # NaN
+    if v is None or v == "" or (isinstance(v, float) and math.isnan(v)):
         return "—"
     try:
         return f"{float(v):.{ndigits}f}"
-    except Exception:
+    except (TypeError, ValueError):
         return str(v)
 
 
@@ -68,7 +69,7 @@ def _split_backend_tag(backend: str) -> Tuple[str, str]:
     if len(parts) == 1:
         return (parts[0], "")
     base, tail = parts
-    m = re.match(r"^t(.+)$", tail)
+    m = _TAG_T_RE.match(tail)
     if m:
         return (base, m.group(1))
     return (base, tail)
@@ -144,11 +145,8 @@ def _long_summary_table(agg: List[Dict[str, Any]]) -> str:
     if has_fa:
         header.append("FA/h")
     rows = [header]
-    # 排序:exp_id, testset, backend_base, tag 数值化
     def sort_key(a):
-        try: tag_n = float(a["tag"]) if a["tag"] else -1
-        except Exception: tag_n = 0
-        return (a["exp_id"], a["testset"], a["backend_base"], tag_n)
+        return (a["exp_id"], a["testset"], a["backend_base"], _safe_tag_sort(a["tag"]))
     for a in sorted(agg, key=sort_key):
         row = [a["exp_id"], a["testset"], a["backend_base"]]
         if has_tag:
@@ -224,8 +222,10 @@ def _per_testset_section(agg: List[Dict[str, Any]]) -> str:
 
 
 def _safe_tag_sort(t: str):
-    try: return float(t)
-    except Exception: return float("inf") if t else -1.0
+    try:
+        return float(t)
+    except (TypeError, ValueError):
+        return float("inf") if t else -1.0
 
 
 def _drop_empty_cols(rows: List[List[str]], fill_token: str = "—") -> List[List[str]]:
@@ -277,8 +277,7 @@ def _threshold_sweep_section(agg: List[Dict[str, Any]]) -> str:
             if "FA/h" in header:
                 row.append(_fmt(a.get("fa_per_hour")))
             rows.append(row)
-        # 检查:每行是不是完全一样(暗示评测脚本没真正按 threshold 解码)
-        # 检查除 tag 列外是否完全一致(暗示 threshold 没生效)
+        # 除 tag 列外完全一致 → threshold 大概率没生效
         body_rows = [tuple(r[1:]) for r in rows[1:] if r[0] != "(no-tag)"]
         identical = len(set(body_rows)) == 1 and len(body_rows) >= 2
         blocks.append(_to_md_table(rows))
@@ -411,18 +410,20 @@ def _best_perf_section(reg: List[Dict[str, str]]) -> str:
     if not scopes:
         return ""
     def _safe(r, k):
-        try: return float(r.get(k) or "nan")
-        except Exception: return float("nan")
+        try:
+            return float(r.get(k) or "nan")
+        except (TypeError, ValueError):
+            return float("nan")
     md = [["scope", "指标", "exp_id", "name", "值"]]
     for s in scopes:
         cand = [(r, _safe(r, f"xrt_{s}")) for r in reg]
-        cand = [c for c in cand if c[1] == c[1]]
+        cand = [c for c in cand if not math.isnan(c[1])]
         if cand:
             best, val = max(cand, key=lambda x: x[1])
             md.append([s, "xRT max", best.get("exp_id", ""),
                        best.get("name", ""), f"{val:.2f}"])
         cand = [(r, _safe(r, f"latp95_{s}")) for r in reg]
-        cand = [c for c in cand if c[1] == c[1]]
+        cand = [c for c in cand if not math.isnan(c[1])]
         if cand:
             best, val = min(cand, key=lambda x: x[1])
             md.append([s, "P95 min", best.get("exp_id", ""),

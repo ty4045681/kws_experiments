@@ -34,6 +34,8 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from parse_perf import collect_perf  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -185,14 +187,10 @@ def parse_experiment(exp_dir: Path) -> dict:
     eval_cfg = cfg.get("eval", {})
     # 优先读字典 eval.negative_hours;未命中时向后兼容 negative_hours_<testset>
     hours_dict = dict(eval_cfg.get("negative_hours") or {})
-    # 兼容老模板的 negative_hours_small / _large 字段
     for k, v in eval_cfg.items():
         if isinstance(k, str) and k.startswith("negative_hours_") and k != "negative_hours":
             ts = k[len("negative_hours_"):]
             hours_dict.setdefault(ts, v)
-    # 默认值
-    hours_dict.setdefault("small", 40)
-    hours_dict.setdefault("large", 23)
 
     def _hours_for(testset: str):
         v = hours_dict.get(testset)
@@ -235,12 +233,6 @@ def parse_experiment(exp_dir: Path) -> dict:
             "per_keyword": per_kw,
         })
 
-    # 顺便收集 perf-*.json(有则有，无则空列表)
-    try:
-        from parse_perf import collect_perf  # type: ignore
-    except Exception:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from parse_perf import collect_perf  # type: ignore
     perf_runs = collect_perf(exp_dir)
 
     result = {

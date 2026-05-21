@@ -111,7 +111,7 @@ def load_manifest(path: str, limit: Optional[int]) -> List[Sample]:
             try:
                 with wave.open(audio, "rb") as w:
                     dur = w.getnframes() / float(w.getframerate())
-            except Exception:
+            except (wave.Error, OSError):
                 dur = 0.0
             out.append(Sample(audio=audio, duration=dur))
             if limit and len(out) >= limit:
@@ -146,15 +146,30 @@ def build_spotter(args: argparse.Namespace) -> "sherpa_onnx.KeywordSpotter":
 
 # ─── 通用:跑一条音频(用于 single / concurrent),返回耗时秒 ─────────────
 
-def decode_one_blocking(kws, audio: np.ndarray, sr: int, chunk_seconds: float,
+_TAIL_SECONDS = 0.66
+_tail_cache: dict = {}
+
+
+def _tail_padding(sr: int) -> np.ndarray:
+    """每个采样率缓存一个尾部静音数组,避免热路径里 np.zeros 分配。"""
+    a = _tail_cache.get(sr)
+    if a is None:
+        a = np.zeros(int(_TAIL_SECONDS * sr), dtype=np.float32)
+        _tail_cache[sr] = a
+    return a
+
+
+def decode_one_blocking(kws, audio: np.ndarray, sr: int, chunk: int,
                         pacing: str = "full") -> float:
     """处理一条音频并返回端到端 wall-clock 秒数。
 
     pacing='realtime' 会按 chunk 长度 sleep,模拟真实流式输入;
     pacing='full'     不 sleep,直接全速喂,measure 纯计算开销。
+
+    `chunk` 已是采样点数;调用方必须预先算好(避免热路径里 int() 与乘法)。
     """
+    tail = _tail_padding(sr)
     s = kws.create_stream()
-    chunk = max(1, int(chunk_seconds * sr))
     t0 = time.perf_counter()
     for start in range(0, len(audio), chunk):
         seg = audio[start:start + chunk]
@@ -166,7 +181,6 @@ def decode_one_blocking(kws, audio: np.ndarray, sr: int, chunk_seconds: float,
                 kws.reset_stream(s)
         if pacing == "realtime":
             time.sleep(len(seg) / sr)
-    tail = np.zeros(int(0.66 * sr), dtype=np.float32)
     s.accept_waveform(sr, tail)
     s.input_finished()
     while kws.is_ready(s):
@@ -186,21 +200,38 @@ class PerCallRecord:
     rtf: float
 
 
+def _preload_pool(samples: List[Sample]) -> List[tuple]:
+    """把所有 wav 一次性解码到内存。返回 [(audio, sr, dur), ...]。"""
+    pool: List[tuple] = []
+    for s in samples:
+        try:
+            audio, sr = read_wave(s.audio)
+        except (wave.Error, OSError, ValueError) as e:
+            print(f"[warn] 跳过 {s.audio}: {e}", file=sys.stderr)
+            continue
+        pool.append((audio, sr, len(audio) / sr))
+    return pool
+
+
 def run_single(kws, samples: List[Sample], chunk_seconds: float,
                warmup: int) -> dict:
     """单线程顺序跑。"""
-    # warmup
-    for s in samples[:warmup]:
-        audio, sr = read_wave(s.audio)
-        decode_one_blocking(kws, audio, sr, chunk_seconds, pacing="full")
+    pool = _preload_pool(samples)
+    if not pool:
+        raise RuntimeError("manifest 中没有可用音频")
+    sr0 = pool[0][1]
+    chunk = max(1, int(chunk_seconds * sr0))
+
+    for audio, sr, _ in pool[:warmup]:
+        decode_one_blocking(kws, audio, sr, chunk if sr == sr0 else max(1, int(chunk_seconds * sr)),
+                            pacing="full")
 
     recs: List[PerCallRecord] = []
-    t_all = time.perf_counter()
     audio_total = 0.0
-    for s in samples:
-        audio, sr = read_wave(s.audio)
-        wall = decode_one_blocking(kws, audio, sr, chunk_seconds, pacing="full")
-        dur = len(audio) / sr
+    t_all = time.perf_counter()
+    for audio, sr, dur in pool:
+        c = chunk if sr == sr0 else max(1, int(chunk_seconds * sr))
+        wall = decode_one_blocking(kws, audio, sr, c, pacing="full")
         audio_total += dur
         recs.append(PerCallRecord(audio_seconds=dur, wall_seconds=wall,
                                   rtf=wall / dur if dur > 0 else 0.0))
@@ -208,16 +239,31 @@ def run_single(kws, samples: List[Sample], chunk_seconds: float,
     return _summarize_single(recs, elapsed, audio_total)
 
 
-def _percentile(xs: List[float], p: float) -> float:
-    if not xs:
-        return 0.0
-    xs = sorted(xs)
-    k = (len(xs) - 1) * p
-    f = int(k)
-    c = min(f + 1, len(xs) - 1)
-    if f == c:
-        return xs[f]
-    return xs[f] + (xs[c] - xs[f]) * (k - f)
+def _latency_stats(walls: List[float], *, with_p90: bool = True,
+                   with_p99: bool = True, with_max: bool = True) -> dict:
+    """从一组耗时(秒)统计 mean/p50/p90/p95/p99/max。空列表返回 0.0。"""
+    if not walls:
+        d = {"mean": 0.0, "p50": 0.0, "p95": 0.0}
+        if with_p90:
+            d["p90"] = 0.0
+        if with_p99:
+            d["p99"] = 0.0
+        if with_max:
+            d["max"] = 0.0
+        return d
+    arr = np.asarray(walls, dtype=np.float64)
+    d = {
+        "mean": round(float(arr.mean()), 4),
+        "p50":  round(float(np.percentile(arr, 50)), 4),
+        "p95":  round(float(np.percentile(arr, 95)), 4),
+    }
+    if with_p90:
+        d["p90"] = round(float(np.percentile(arr, 90)), 4)
+    if with_p99:
+        d["p99"] = round(float(np.percentile(arr, 99)), 4)
+    if with_max:
+        d["max"] = round(float(arr.max()), 4)
+    return d
 
 
 def _summarize_single(recs: List[PerCallRecord], elapsed: float,
@@ -229,20 +275,8 @@ def _summarize_single(recs: List[PerCallRecord], elapsed: float,
         "elapsed_seconds": round(elapsed, 4),
         "audio_seconds_total": round(audio_total, 4),
         "throughput_audio_per_wall": round(audio_total / elapsed, 4) if elapsed > 0 else 0.0,
-        "latency_seconds": {
-            "mean": round(statistics.fmean(walls), 4) if walls else 0.0,
-            "p50":  round(_percentile(walls, 0.50), 4),
-            "p90":  round(_percentile(walls, 0.90), 4),
-            "p95":  round(_percentile(walls, 0.95), 4),
-            "p99":  round(_percentile(walls, 0.99), 4),
-            "max":  round(max(walls), 4) if walls else 0.0,
-        },
-        "rtf": {
-            "mean": round(statistics.fmean(rtfs), 4) if rtfs else 0.0,
-            "p50":  round(_percentile(rtfs, 0.50), 4),
-            "p95":  round(_percentile(rtfs, 0.95), 4),
-            "max":  round(max(rtfs), 4) if rtfs else 0.0,
-        },
+        "latency_seconds": _latency_stats(walls),
+        "rtf": _latency_stats(rtfs, with_p90=False, with_p99=False),
     }
 
 
@@ -252,31 +286,27 @@ def run_concurrent(kws_factory, samples: List[Sample], chunk_seconds: float,
     """N 路并发。每个线程独立一个 KeywordSpotter,共享音频池循环喂。
     跑满 duration_seconds 后停。
     """
+    pool = _preload_pool(samples)
+    if not pool:
+        raise RuntimeError("manifest 中没有可用音频")
+    sr0 = pool[0][1]
+    chunk = max(1, int(chunk_seconds * sr0))
+
     stop_flag = threading.Event()
     per_thread_recs: List[List[PerCallRecord]] = [[] for _ in range(concurrency)]
 
-    # 预加载音频(避免 I/O 干扰)
-    pool: List[tuple] = []
-    for s in samples:
-        try:
-            audio, sr = read_wave(s.audio)
-            pool.append((audio, sr, len(audio) / sr))
-        except Exception as e:
-            print(f"[warn] 跳过 {s.audio}: {e}", file=sys.stderr)
-    if not pool:
-        raise RuntimeError("manifest 中没有可用音频")
-
     def worker(tid: int):
         kws = kws_factory()
-        # warmup
         for i in range(warmup):
             audio, sr, _ = pool[i % len(pool)]
-            decode_one_blocking(kws, audio, sr, chunk_seconds, pacing="full")
+            c = chunk if sr == sr0 else max(1, int(chunk_seconds * sr))
+            decode_one_blocking(kws, audio, sr, c, pacing="full")
         i = 0
         while not stop_flag.is_set():
             audio, sr, dur = pool[i % len(pool)]
             i += 1
-            wall = decode_one_blocking(kws, audio, sr, chunk_seconds, pacing=pacing)
+            c = chunk if sr == sr0 else max(1, int(chunk_seconds * sr))
+            wall = decode_one_blocking(kws, audio, sr, c, pacing=pacing)
             per_thread_recs[tid].append(
                 PerCallRecord(audio_seconds=dur, wall_seconds=wall,
                               rtf=wall / dur if dur > 0 else 0.0)
@@ -293,7 +323,6 @@ def run_concurrent(kws_factory, samples: List[Sample], chunk_seconds: float,
         t.join(timeout=60)
     elapsed = time.perf_counter() - t0
 
-    # 汇总
     all_recs = [r for lst in per_thread_recs for r in lst]
     audio_total = sum(r.audio_seconds for r in all_recs)
     walls = [r.wall_seconds for r in all_recs]
@@ -308,18 +337,8 @@ def run_concurrent(kws_factory, samples: List[Sample], chunk_seconds: float,
         "audio_seconds_total": round(audio_total, 4),
         "throughput_audio_per_wall": round(audio_total / elapsed, 4) if elapsed > 0 else 0.0,
         "throughput_calls_per_sec": round(len(all_recs) / elapsed, 4) if elapsed > 0 else 0.0,
-        "latency_seconds": {
-            "mean": round(statistics.fmean(walls), 4) if walls else 0.0,
-            "p50":  round(_percentile(walls, 0.50), 4),
-            "p90":  round(_percentile(walls, 0.90), 4),
-            "p95":  round(_percentile(walls, 0.95), 4),
-            "p99":  round(_percentile(walls, 0.99), 4),
-            "max":  round(max(walls), 4) if walls else 0.0,
-        },
-        "rtf_per_stream": {
-            "mean": round(statistics.fmean(rtfs), 4) if rtfs else 0.0,
-            "p95":  round(_percentile(rtfs, 0.95), 4),
-        },
+        "latency_seconds": _latency_stats(walls),
+        "rtf_per_stream": _latency_stats(rtfs, with_p90=False, with_p99=False, with_max=False),
     }
 
 
@@ -330,34 +349,29 @@ def run_batch(kws, samples: List[Sample], chunk_seconds: float,
     每个 batch:同时 create_stream batch_size 条 -> 全量喂完 -> 反复
     decode_streams([active streams]) 直到所有 stream is_ready=False。
     """
-    # 预加载
-    pool = []
-    for s in samples:
-        try:
-            audio, sr = read_wave(s.audio)
-            pool.append((audio, sr))
-        except Exception:
-            continue
+    raw_pool = _preload_pool(samples)
+    if not raw_pool:
+        raise RuntimeError("manifest 中没有可用音频")
+    pool = [(a, sr) for a, sr, _ in raw_pool]
     if len(pool) < batch_size:
-        # 循环复用
-        while len(pool) < batch_size:
-            pool.extend(pool[:batch_size - len(pool)])
+        reps = (batch_size // len(pool)) + 1
+        pool = (pool * reps)[:batch_size]
+    sr0 = pool[0][1]
+    chunk = max(1, int(chunk_seconds * sr0))
+    tail = _tail_padding(sr0)
 
     def _run_one_batch() -> tuple:
         streams = [kws.create_stream() for _ in range(batch_size)]
         audio_total = 0.0
         t0 = time.perf_counter()
-        # 全量喂入
         for i, s in enumerate(streams):
             audio, sr = pool[i % len(pool)]
             audio_total += len(audio) / sr
-            chunk = max(1, int(chunk_seconds * sr))
-            for start in range(0, len(audio), chunk):
-                s.accept_waveform(sr, audio[start:start + chunk])
-            tail = np.zeros(int(0.66 * sr), dtype=np.float32)
-            s.accept_waveform(sr, tail)
+            c = chunk if sr == sr0 else max(1, int(chunk_seconds * sr))
+            for start in range(0, len(audio), c):
+                s.accept_waveform(sr, audio[start:start + c])
+            s.accept_waveform(sr, tail if sr == sr0 else _tail_padding(sr))
             s.input_finished()
-        # 反复批解码
         while True:
             ready = [s for s in streams if kws.is_ready(s)]
             if not ready:
@@ -370,7 +384,6 @@ def run_batch(kws, samples: List[Sample], chunk_seconds: float,
         wall = time.perf_counter() - t0
         return wall, audio_total
 
-    # warmup
     for _ in range(max(0, warmup)):
         _run_one_batch()
 
@@ -385,7 +398,6 @@ def run_batch(kws, samples: List[Sample], chunk_seconds: float,
 
     total_calls = n_batches * batch_size
     total_audio = sum(batch_audio)
-    # 等效每条延迟 = batch 总耗时 / batch_size(batch 内并行处理)
     per_call_latency = [w / batch_size for w in batch_walls]
     return {
         "batch_size": batch_size,
@@ -395,20 +407,12 @@ def run_batch(kws, samples: List[Sample], chunk_seconds: float,
         "audio_seconds_total": round(total_audio, 4),
         "throughput_audio_per_wall": round(total_audio / total_elapsed, 4) if total_elapsed > 0 else 0.0,
         "throughput_calls_per_sec": round(total_calls / total_elapsed, 4) if total_elapsed > 0 else 0.0,
-        "batch_wall_seconds": {
-            "mean": round(statistics.fmean(batch_walls), 4) if batch_walls else 0.0,
-            "p50":  round(_percentile(batch_walls, 0.50), 4),
-            "p95":  round(_percentile(batch_walls, 0.95), 4),
-            "max":  round(max(batch_walls), 4) if batch_walls else 0.0,
-        },
-        "per_call_latency_seconds": {
-            "mean": round(statistics.fmean(per_call_latency), 4) if per_call_latency else 0.0,
-            "p50":  round(_percentile(per_call_latency, 0.50), 4),
-            "p95":  round(_percentile(per_call_latency, 0.95), 4),
-        },
+        "batch_wall_seconds": _latency_stats(batch_walls, with_p90=False, with_p99=False),
+        "per_call_latency_seconds": _latency_stats(per_call_latency, with_p90=False,
+                                                    with_p99=False, with_max=False),
         "batch_rtf": {
             "mean": round(statistics.fmean(
-                [w / a if a > 0 else 0 for w, a in zip(batch_walls, batch_audio)]
+                w / a for w, a in zip(batch_walls, batch_audio) if a > 0
             ), 4) if batch_walls else 0.0,
         },
     }
@@ -424,17 +428,14 @@ def env_info(args) -> dict:
         "provider": args.provider,
         "num_threads": args.num_threads,
     }
-    try:
-        info["sherpa_onnx_version"] = getattr(sherpa_onnx, "__version__", "unknown")
-    except Exception:
-        pass
+    info["sherpa_onnx_version"] = getattr(sherpa_onnx, "__version__", "unknown") if sherpa_onnx else "unknown"
     try:
         with open("/proc/cpuinfo", "r") as f:
             for line in f:
                 if "model name" in line:
                     info["cpu_model"] = line.split(":", 1)[1].strip()
                     break
-    except Exception:
+    except OSError:
         pass
     return info
 
@@ -490,6 +491,7 @@ def main():
     args = parse_args()
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_sherpa()
 
     print(f"[info] 加载 manifest: {args.manifest}", flush=True)
     samples = load_manifest(args.manifest, args.limit)

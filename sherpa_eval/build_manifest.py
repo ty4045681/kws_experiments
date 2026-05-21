@@ -54,7 +54,7 @@ def wav_duration(path: Path) -> Optional[float]:
     try:
         with wave.open(str(path)) as f:
             return f.getnframes() / float(f.getframerate())
-    except Exception:
+    except (wave.Error, OSError):
         return None
 
 

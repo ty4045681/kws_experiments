@@ -75,18 +75,15 @@ if [[ $stage -le 1 && $stop_stage -ge 1 ]]; then
   if [[ -z "$NAME" ]]; then
     echo "[error] stage 1 需要 --name"; exit 1
   fi
-  # 捕获 new_experiment.py 的输出,提取生成的目录路径
-  out=$("$PYTHON" scripts/new_experiment.py \
+  # new_experiment.py --print-path 在 stdout 只输出相对路径,其它信息走 stderr
+  EXP_DIR="$("$PYTHON" scripts/new_experiment.py --print-path \
         --name "$NAME" \
         ${VARIABLE:+--variable "$VARIABLE"} \
         ${VALUE:+--value "$VALUE"} \
-        ${NOTES:+--notes "$NOTES"})
-  echo "$out"
-  EXP_DIR="$(echo "$out" | sed -n 's|^已创建 \(.*\)$|\1|p' | head -1)"
+        ${NOTES:+--notes "$NOTES"})"
   if [[ -z "$EXP_DIR" ]]; then
-    echo "[error] 未能从输出中解析出 EXP_DIR"; exit 1
+    echo "[error] new_experiment.py 没有打印路径"; exit 1
   fi
-  EXP_DIR="$(realpath --relative-to="$ROOT" "$EXP_DIR" 2>/dev/null || echo "$EXP_DIR")"
   echo "[info] EXP_DIR = $EXP_DIR"
   echo
   echo "下一步:跑你的训练 + decode,把产出的 metric-*.txt 重命名后放入:"

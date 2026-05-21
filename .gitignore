@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Generated artifacts (重建即可)
+/registry.csv
+/per_command.csv
+/per_perf.csv
+/REPORT.md
+runs/*/metrics.json
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
