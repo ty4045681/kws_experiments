@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import csv
 import datetime
+import json
 import math
+import os
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -31,6 +33,10 @@ OUT = ROOT / "REPORT.md"
 
 _PERF_NDIGITS = 3
 _TAG_T_RE = re.compile(r"^t(.+)$")
+
+# 默认在 sherpa_eval/data 下查 *.jsonl 当作 testset 的 manifest。
+# 可用环境变量覆盖:MANIFEST_DIRS=/path/a:/path/b
+_DEFAULT_MANIFEST_DIRS = [ROOT / "sherpa_eval" / "data"]
 
 
 # ─── 通用工具 ───────────────────────────────────────────────────────────
@@ -350,6 +356,105 @@ def _experiment_meta_section(reg: List[Dict[str, str]]) -> str:
     return _to_md_table(rows)
 
 
+# ─── 测试集 · 音频长度统计 ────────────────────────────────────────────
+
+def _manifest_dirs() -> List[Path]:
+    env = os.environ.get("MANIFEST_DIRS")
+    if env:
+        return [Path(p).expanduser().resolve() for p in env.split(":") if p]
+    return list(_DEFAULT_MANIFEST_DIRS)
+
+
+def _percentile(sorted_vals: List[float], p: float) -> float:
+    """Nearest-rank 百分位。空列表返回 0。"""
+    if not sorted_vals:
+        return 0.0
+    if p <= 0:
+        return sorted_vals[0]
+    if p >= 100:
+        return sorted_vals[-1]
+    rank = int(math.ceil(p / 100.0 * len(sorted_vals)))
+    return sorted_vals[max(0, rank - 1)]
+
+
+def _load_testset_durations(testsets: Set[str]) -> Dict[str, List[float]]:
+    """扫描 _manifest_dirs() 下 *.jsonl,按 stem 匹配 testset 名,
+    读取每行 JSON 的 duration 字段。
+    同一 testset 在多个目录命中时,使用第一个非空的。
+    """
+    out: Dict[str, List[float]] = {}
+    for d in _manifest_dirs():
+        if not d.exists():
+            continue
+        for jsonl in sorted(d.glob("*.jsonl")):
+            ts = jsonl.stem
+            if testsets and ts not in testsets:
+                continue
+            if ts in out:  # 已被前一个目录命中
+                continue
+            durs: List[float] = []
+            try:
+                with jsonl.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                        v = obj.get("duration")
+                        if v is None:
+                            continue
+                        try:
+                            durs.append(float(v))
+                        except (TypeError, ValueError):
+                            continue
+            except OSError:
+                continue
+            if durs:
+                out[ts] = durs
+    return out
+
+
+def _testset_duration_section(
+    testsets: Set[str], durations_by_ts: Dict[str, List[float]]
+) -> str:
+    """每个 testset 一行的时长统计表。
+
+    返回空串当所有 testset 都没有可用 duration 数据。
+    """
+    if not testsets:
+        return ""
+    header = ["testset", "n", "总时长(s)", "总时长(min)",
+              "min", "p50", "p90", "p99", "max", "mean"]
+    rows: List[List[str]] = [header]
+    have_any = False
+    for ts in sorted(testsets):
+        durs = durations_by_ts.get(ts, [])
+        if not durs:
+            rows.append([ts, "—", "—", "—", "—", "—", "—", "—", "—", "—"])
+            continue
+        have_any = True
+        sd = sorted(durs)
+        n = len(sd)
+        total = sum(sd)
+        rows.append([
+            ts, str(n),
+            f"{total:.1f}",
+            f"{total/60:.1f}",
+            f"{sd[0]:.2f}",
+            f"{_percentile(sd, 50):.2f}",
+            f"{_percentile(sd, 90):.2f}",
+            f"{_percentile(sd, 99):.2f}",
+            f"{sd[-1]:.2f}",
+            f"{total/n:.2f}",
+        ])
+    if not have_any:
+        return ""
+    return _to_md_table(rows)
+
+
 # ─── perf 章节(基本沿用旧实现) ────────────────────────────────────────
 
 def _discover_perf_scopes(reg: List[Dict[str, str]]) -> List[str]:
@@ -456,6 +561,23 @@ def main() -> None:
         lines += ["## 实验元数据", "", _experiment_meta_section(reg), ""]
 
     if agg:
+        testsets_seen: Set[str] = {a["testset"] for a in agg}
+        ts_durs = _load_testset_durations(testsets_seen)
+        ts_section = _testset_duration_section(testsets_seen, ts_durs)
+        if ts_section:
+            lines += [
+                "## 测试集 · 音频长度统计",
+                "",
+                "_数据来源:`sherpa_eval/data/<testset>.jsonl` 的 `duration` 字段。"
+                "时长直接影响 `latency_seconds`(随音频长度线性增长)与 `cps`(反向);"
+                "横比延迟时需先对齐分布,或改用 RTF/xRT。"
+                "若某行全 `—`,说明对应 manifest 不存在或缺 `duration` 字段——"
+                "重新跑 `sherpa_eval/build_manifest.py` 即可补上。_",
+                "",
+                ts_section,
+                "",
+            ]
+
         cov = _coverage_section(agg)
         if cov:
             lines += ["## 准确率 · 覆盖矩阵", "", cov, ""]
