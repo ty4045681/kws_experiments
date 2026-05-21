@@ -1,0 +1,7 @@
+# sherpa-onnx KWS keywords file
+# 格式: <BPE/字符 tokens 用空格分隔> @<原文 phrase,大写>
+# 这里只是示例,实际 tokens 要用你模型的 tokens.txt 切出来。
+
+L IGHT S _ON @LIGHTS ON
+H EAT _UP @HEAT UP
+T URN _OFF @TURN OFF

@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# sherpa_perf/run.sh —— sherpa-onnx KWS 推理性能测试一键脚本
+#
+# 用一个 SCENES 数组配置任意多个性能测试场景:
+#   - single        : 单线程顺序解码,测时延 / RTF
+#   - concurrent    : N 路并发 stream,测吞吐 / P95 延迟
+#   - batch         : decode_streams 批量解码,测 batch 吞吐
+#
+# 每个场景产出一份 perf-<scene>-<backend>[-tag].json,直接落入上层脚手架
+# 的实验 metrics/ 目录,被 scripts/parse_perf.py 收纳。
+#
+# ──────── 配置方式 ───────────────────────────────────────────────────────
+# 在脚本顶部 SCENES 数组按下面 5 段加场景:
+#   SCENES+=("scene|mode|arg1|arg2|tag")
+# 各 mode 的 arg 含义:
+#   single      arg1=<n_samples 限制,空=全部>  arg2=<num_threads(spotter)>
+#   concurrent  arg1=<concurrency>             arg2=<duration_seconds>
+#                                              并配合全局 PACING=full|realtime
+#   batch       arg1=<batch_size>              arg2=<n_batches>
+# tag 是可选后缀,合并进文件名,如 -realtime / -bs16
+#
+# ──────── 用法 ───────────────────────────────────────────────────────────
+# 跑全部场景:
+#   bash sherpa_perf/run.sh
+# 只跑某个场景:
+#   bash sherpa_perf/run.sh --only concurrent_c8
+# 改输出目录:
+#   bash sherpa_perf/run.sh --output-dir ../runs/exp003_xxx/metrics
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+# ─────────────── 用户配置区 ─────────────────────────────────────────────────
+stage=1
+stop_stage=1
+
+# --- 模型 ---
+TOKENS="model/tokens.txt"
+ENCODER="model/encoder-epoch-12-avg-2-chunk-16-left-128.onnx"
+DECODER="model/decoder-epoch-12-avg-2-chunk-16-left-128.onnx"
+JOINER="model/joiner-epoch-12-avg-2-chunk-16-left-128.onnx"
+KEYWORDS_FILE="model/keywords.txt"
+
+# --- 数据(复用 sherpa_eval 的 manifest)---
+MANIFEST="../sherpa_eval/data/wakeword_pos.jsonl"
+
+# --- 通用推理参数 ---
+SUFFIX="onnx"
+CHUNK_SECONDS="0.5"
+PROVIDER="cpu"
+NUM_THREADS_DEFAULT="2"          # spotter 内 ORT 线程数
+KW_THRESHOLD="0.35"
+PACING="full"                    # concurrent 默认全速;改 realtime 模拟实时流
+WARMUP="2"
+
+# --- 输出目录(默认落到 baseline 实验)---
+OUTPUT_DIR="../runs/exp001_baseline/metrics"
+
+# --- 场景表 ----------------------------------------------------------------
+# 格式: "scene|mode|arg1|arg2|tag"
+SCENES=()
+
+# 1) 单线程基线
+SCENES+=("single_cpu1t|single|50|1|")
+
+# 2) 单实例 4 线程,看 ORT intra-op 加速
+SCENES+=("single_cpu4t|single|50|4|")
+
+# 3) 4 路并发(每路独立 spotter,各 1 线程)
+SCENES+=("concurrent_c4|concurrent|4|30|")
+
+# 4) 8 路并发
+SCENES+=("concurrent_c8|concurrent|8|30|")
+
+# 5) batch_size=8 的批量解码
+SCENES+=("batch_b8|batch|8|20|")
+
+# 6) batch_size=16
+SCENES+=("batch_b16|batch|16|20|")
+
+# --- 只跑某个场景(命令行 --only)---
+ONLY=""
+
+PYTHON=${PYTHON:-python3}
+# ─────────────── 用户配置区结束 ────────────────────────────────────────────
+
+# ─── 解析命令行覆盖 ───────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --stage)            stage="$2"; shift 2 ;;
+    --stop-stage)       stop_stage="$2"; shift 2 ;;
+    --tokens)           TOKENS="$2"; shift 2 ;;
+    --encoder)          ENCODER="$2"; shift 2 ;;
+    --decoder)          DECODER="$2"; shift 2 ;;
+    --joiner)           JOINER="$2"; shift 2 ;;
+    --keywords-file)    KEYWORDS_FILE="$2"; shift 2 ;;
+    --manifest)         MANIFEST="$2"; shift 2 ;;
+    --suffix)           SUFFIX="$2"; shift 2 ;;
+    --chunk-seconds)    CHUNK_SECONDS="$2"; shift 2 ;;
+    --provider)         PROVIDER="$2"; shift 2 ;;
+    --keywords-threshold) KW_THRESHOLD="$2"; shift 2 ;;
+    --pacing)           PACING="$2"; shift 2 ;;
+    --warmup)           WARMUP="$2"; shift 2 ;;
+    --output-dir)       OUTPUT_DIR="$2"; shift 2 ;;
+    --only)             ONLY="$2"; shift 2 ;;
+    --python)           PYTHON="$2"; shift 2 ;;
+    -h|--help)
+      sed -n '2,40p' "$0"; exit 0 ;;
+    *)
+      echo "[error] 未知参数: $1"; exit 1 ;;
+  esac
+done
+
+# ─── 进入脚本所在目录 ─────────────────────────────────────────────────────
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+cd "$HERE"
+echo "[info] cwd        = $HERE"
+echo "[info] manifest   = $MANIFEST"
+echo "[info] output_dir = $OUTPUT_DIR"
+
+mkdir -p "$OUTPUT_DIR"
+
+log() { echo -e "\n========== $* =========="; }
+
+# ─── 解析一行 SCENES -> _SC_NAME _SC_MODE _SC_A1 _SC_A2 _SC_TAG ───────────
+parse_scene() {
+  local entry="$1"
+  IFS='|' read -r _SC_NAME _SC_MODE _SC_A1 _SC_A2 _SC_TAG <<< "$entry"
+  _SC_NAME="${_SC_NAME:-}"
+  _SC_MODE="${_SC_MODE:-}"
+  _SC_A1="${_SC_A1:-}"
+  _SC_A2="${_SC_A2:-}"
+  _SC_TAG="${_SC_TAG:-}"
+  if [[ -z "$_SC_NAME" || -z "$_SC_MODE" ]]; then
+    echo "[error] 场景格式错误: '$entry'"; return 1
+  fi
+}
+
+# ─── 跑单个场景 ────────────────────────────────────────────────────────────
+run_one_scene() {
+  local name="$1" mode="$2" a1="$3" a2="$4" tag="$5"
+  local common=(
+    --tokens   "$TOKENS"
+    --encoder  "$ENCODER"
+    --decoder  "$DECODER"
+    --joiner   "$JOINER"
+    --keywords-file "$KEYWORDS_FILE"
+    --manifest "$MANIFEST"
+    --chunk-seconds "$CHUNK_SECONDS"
+    --provider "$PROVIDER"
+    --keywords-threshold "$KW_THRESHOLD"
+    --output-dir "$OUTPUT_DIR"
+    --scene    "$name"
+    --suffix   "$SUFFIX"
+    --warmup   "$WARMUP"
+  )
+  [[ -n "$tag" ]] && common+=(--tag "$tag")
+
+  case "$mode" in
+    single)
+      local limit_arg=()
+      [[ -n "$a1" ]] && limit_arg=(--limit "$a1")
+      local nt="${a2:-$NUM_THREADS_DEFAULT}"
+      echo "  [perf] $name single  limit=${a1:-all}  num_threads=$nt"
+      "$PYTHON" sherpa_onnx_kws_perf.py \
+          "${common[@]}" --mode single --num-threads "$nt" "${limit_arg[@]}"
+      ;;
+    concurrent)
+      local conc="${a1:?需要 concurrency}"
+      local dur="${a2:-30}"
+      echo "  [perf] $name concurrent  N=$conc  duration=${dur}s  pacing=$PACING"
+      "$PYTHON" sherpa_onnx_kws_perf.py \
+          "${common[@]}" --mode concurrent \
+          --num-threads 1 \
+          --concurrency "$conc" --duration-seconds "$dur" --pacing "$PACING"
+      ;;
+    batch)
+      local bs="${a1:?需要 batch_size}"
+      local nb="${a2:-20}"
+      echo "  [perf] $name batch  batch_size=$bs  n_batches=$nb"
+      "$PYTHON" sherpa_onnx_kws_perf.py \
+          "${common[@]}" --mode batch \
+          --num-threads "$NUM_THREADS_DEFAULT" \
+          --batch-size "$bs" --n-batches "$nb"
+      ;;
+    *)
+      echo "[error] $name: 未知 mode='$mode' (single/concurrent/batch)"
+      return 1
+      ;;
+  esac
+}
+
+# ─── 校验场景表 ────────────────────────────────────────────────────────────
+if [[ ${#SCENES[@]} -eq 0 ]]; then
+  echo "[error] SCENES 数组为空,请在脚本顶部至少配置一个场景"; exit 1
+fi
+
+# 过滤 --only
+declare -a ACTIVE
+if [[ -n "$ONLY" ]]; then
+  for e in "${SCENES[@]}"; do
+    parse_scene "$e"
+    [[ "$_SC_NAME" == "$ONLY" ]] && ACTIVE+=("$e")
+  done
+  if [[ ${#ACTIVE[@]} -eq 0 ]]; then
+    echo "[error] --only $ONLY 没有匹配任何场景"; exit 1
+  fi
+else
+  ACTIVE=("${SCENES[@]}")
+fi
+echo "[info] 即将处理 ${#ACTIVE[@]} 个场景:"
+for e in "${ACTIVE[@]}"; do parse_scene "$e"; echo "  - $_SC_NAME ($_SC_MODE)"; done
+
+# ─── stage 1 : 跑所有场景 ──────────────────────────────────────────────────
+if [[ $stage -le 1 && $stop_stage -ge 1 ]]; then
+  log "Stage 1: 运行性能测试  $(date '+%Y-%m-%d %H:%M:%S')"
+  for f in "$TOKENS" "$ENCODER" "$DECODER" "$JOINER" "$KEYWORDS_FILE" "$MANIFEST"; do
+    [[ -f "$f" ]] || { echo "[error] 文件不存在: $f"; exit 1; }
+  done
+  for e in "${ACTIVE[@]}"; do
+    parse_scene "$e"
+    run_one_scene "$_SC_NAME" "$_SC_MODE" "$_SC_A1" "$_SC_A2" "$_SC_TAG"
+  done
+fi
+
+echo
+echo "[done] sherpa_perf 完成 (处理 ${#ACTIVE[@]} 个场景)。"
+echo "      产出文件位于 $OUTPUT_DIR/perf-*.json"
+echo "      下一步:在脚手架根目录跑 scripts/run.sh --stage 2 入库"

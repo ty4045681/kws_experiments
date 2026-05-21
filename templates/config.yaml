@@ -1,0 +1,68 @@
+# 单次实验配置模板。复制到 runs/expNNN_<name>/config.yaml 后修改。
+# 只用于"描述"这次实验,不会被 icefall 直接读取。
+# 解析脚本只用到 eval.* 和 meta.* 字段,其它字段都是给你自己看的。
+
+meta:
+  exp_id: exp000                # 由 new_experiment.py 自动填
+  name: baseline                # 给人看的短名,如 "lr5e-5"
+  date: "2026-05-19"            # 创建日期
+  variable: lr                  # 本次消融改的变量名(便于分组)
+  value: "5e-4"                 # 变量的取值(字符串)
+  notes: ""                     # 自由备注:动机、特殊操作等
+  ckpt_path: ""                 # 模型 checkpoint 路径(相对/绝对都可)
+
+# 训练阶段超参(沿用 icefall run.sh 的字段名,方便对照)
+train:
+  stage: pretrain               # pretrain / finetune
+  base_model: zipformer-3.3M
+  subset: XL
+  bpe_size: 500
+  num_epochs: 12
+  start_epoch: 1
+  base_lr: 0.045                # finetune 时改为 0.0005
+  lr_epochs: 1.5
+  lr_batches: 7500
+  max_duration: 1000
+  use_fp16: true
+  causal: true
+  # 编码器结构(默认值来自 run.sh)
+  num_encoder_layers: "1,1,1,1,1,1"
+  feedforward_dim: "192,192,192,192,192,192"
+  encoder_dim: "128,128,128,128,128,128"
+  encoder_unmasked_dim: "128,128,128,128,128,128"
+  decoder_dim: 320
+  joiner_dim: 320
+
+# 解码 / 评测设置
+decode:
+  epoch: 12
+  avg: 2
+  chunk_size: 16
+  left_context_frames: 64
+  keywords_score: 1.0
+  keywords_threshold: 0.35
+  max_duration: 3000
+
+# ONNX 部署(可选)
+onnx:
+  exported: false               # 是否导出过 ONNX
+  quant: fp32                   # fp32 / fp16 / int8
+  chunk_size: 16
+  left_context_frames: 128      # 注意:run.sh 里 export 用 128
+
+# 评测口径:用来把 FP 换算成 FA/hour
+# negative_hours 是任意 testset 名 -> 负样本总时长(小时)的字典。
+# 评测脚本会优先读 negative_hours[testset];未命中时向后兼容 negative_hours_{testset}。
+eval:
+  negative_hours:
+    small: 40                   # icefall RESULTS.md 默认
+    large: 23                   # icefall RESULTS.md 默认
+    # 可以继续加你自己的测试集,例如:
+    # mywakeword: 5.5
+    # car_noise:  2.1
+
+# 性能测试(可选)。sherpa_perf/run.sh 产出的 perf-*.json 会被自动收集。
+# 以下字段仅作为实验记录使用，脚手架不会读取。
+perf:
+  hardware: ""                  # 说明跑测试的机器（例：Xeon 8358 32C / Jetson Orin Nano）
+  notes: ""                     # 场景说明

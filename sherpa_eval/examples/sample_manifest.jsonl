@@ -1,0 +1,4 @@
+{"id": "pos_001", "audio": "/abs/path/pos_001.wav", "text": "PLEASE_TURN_ON_THE_LIGHTS_ON_BEFORE_DINNER", "duration": 2.4}
+{"id": "pos_002", "audio": "/abs/path/pos_002.wav", "text": "HEAT_UP_THE_OVEN", "duration": 1.6}
+{"id": "neg_001", "audio": "/abs/path/neg_001.wav", "text": "I_WENT_TO_THE_PARK_YESTERDAY", "duration": 3.1}
+{"id": "neg_002", "audio": "/abs/path/neg_002.wav", "text": "WHAT_TIME_IS_IT", "duration": 1.2}
