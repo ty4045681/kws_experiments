@@ -15,14 +15,16 @@ sherpa_perf/
 
 ## 1. 模式概览
 
-| Mode         | 回答的问题                                    | 关键产出                                   |
-|--------------|-----------------------------------------------|--------------------------------------------|
-| `single`     | 单条音频端到端处理多久？是否能跑实时？        | `latency_seconds.{p50,p95,p99}`、`rtf.mean` |
-| `concurrent` | 并发 N 路时尾延迟还稳吗？这台机器顶几路？     | `latency_seconds.p95`、`rtf_per_stream.p95` |
-| `batch`      | 服务端批量推理，每条等效延迟与吞吐？          | `throughput_calls_per_sec`、`batch_rtf`     |
+| Mode              | 回答的问题                                                  | 关键产出                                            |
+|-------------------|-------------------------------------------------------------|-----------------------------------------------------|
+| `single`          | 单条音频端到端处理多久？是否能跑实时？                      | `latency_seconds.{p50,p95,p99}`、`rtf.mean`         |
+| `concurrent`      | 并发 N 路时尾延迟还稳吗？这台机器顶几路？                   | `latency_seconds.p95`、`rtf_per_stream.p95`         |
+| `batch`           | 服务端凑齐 B 条音频后批量推理，吞吐上限是多少？             | `throughput_calls_per_sec`、`batch_rtf`             |
+| `batch_streaming` | B 路真实实时流共享同一次 batch forward，单条 SLO 怎样？     | `latency_seconds.p95`、`throughput_calls_per_sec`   |
 
 设计原则：**真实部署里每路通常是独立解码状态机**，所以 `concurrent` 给每个 worker 独立 `KeywordSpotter`；
-`batch` 模式要利用 sherpa-onnx 的 `decode_streams([...])` 批解码 API，必须共享同一个 spotter。
+`batch` 与 `batch_streaming` 都要利用 sherpa-onnx 的 `decode_streams([...])` 批解码 API，必须共享同一个 spotter，差别只在喂入节奏：
+`batch` 全量喂完一批再解，`batch_streaming` 是 B 路时间片交错喂入、每 tick 一次 batch forward。
 
 ---
 
@@ -277,19 +279,68 @@ T = 0.062s  return wall = 0.062, audio_total = 24.0  (8 × 3s)
 
 - `per_call_latency_seconds = batch_wall / batch_size` —— **摊销值**，不是用户等待时间。
 - 用户真实等待 = 单 batch wall + 凑齐 batch 的排队时间。
-- 因此：**端侧实时唤醒禁用 batch；服务端语音网关才用 batch。**
+- 因此：**端侧实时唤醒禁用 batch；服务端语音网关用 `batch` 看吞吐上限，用 `batch_streaming` 看真实 SLO。**
 
-### 3.5 三种模式音频路径对比
+### 3.5 `batch_streaming` 模式时间轴
 
-| 阶段          | `single`                          | `concurrent` (`realtime`)                 | `batch`                                |
-|---------------|-----------------------------------|-------------------------------------------|----------------------------------------|
-| 入口          | 主线程顺序取                      | N worker 从共享只读池循环取               | 主线程为本批构造 B 条 stream           |
-| Spotter       | 1 个                              | **每线程 1 个**                           | 1 个共享                               |
-| Stream 数     | 1                                 | N（每线程 1）                             | B（同一 spotter 持有）                 |
-| 节奏          | 全速喂                            | 每片 `sleep(len/sr)`                      | 全速喂完所有条                         |
-| 算的时机      | 每片立刻 `decode_stream`          | 每片立刻 `decode_stream`                  | 全量喂入后 `decode_streams` 反复批算   |
-| 终止          | pool 跑完                         | `sleep(duration)` 到点                    | `n_batches` 跑完                       |
-| 关键 metric   | `latency.p95` / `rtf.mean`        | `latency.p95` / `rtf_per_stream.p95`      | `throughput_calls_per_sec` / `batch_rtf` |
+`run_batch_streaming` 是"batch 但流式"——和 `batch` 一样共享单个 `KeywordSpotter`、用 `decode_streams([...])` 一次跑多条流；但和 `batch` 不同，B 条流在时间轴上是**交错的**，不是"全喂完再批解"。这是服务端语音网关真实部署的形态。
+
+主循环每个 tick 做四件事（假设 `--concurrency 8 --pacing realtime`、3s 音频）：
+
+```
+T = 0.000s  tick_start
+            ┌────────── (a) 喂 ──────────────────────────────────┐
+            │ for st in active (B=8):                            │
+            │   若还有 chunk:    accept_waveform(0.5s)           │
+            │   否则若没喂 tail: accept_waveform(0.66s 静音)     │
+            │   否则若没 finish: input_finished()                │
+            └────────────────────────────────────────────────────┘
+            ┌────────── (b) 批解码 ──────────────────────────────┐
+            │ while True:                                        │
+            │   ready = [st.s for st in active if is_ready(s)]   │
+            │   if not ready: break                              │
+            │   kws.decode_streams(ready)   ← ★ 一次 forward     │
+            │   for st: get_result; 命中则 reset_stream          │
+            └────────────────────────────────────────────────────┘
+            ┌────────── (c) 回收 / 替换 ─────────────────────────┐
+            │ for st in active:                                  │
+            │   if finished_input and not is_ready(s):           │
+            │     记录 wall = now - st.t_start                   │
+            │     active[i] = _new_slot()  ← ★ 立刻补一条新流    │
+            └────────────────────────────────────────────────────┘
+T = 0.5s    (d) realtime 时 sleep 把 tick 凑到 chunk_seconds (0.5s)
+            进入下一个 tick
+```
+
+**完成判定**：与 `run_batch` 主循环 break 条件一致 —— `input_finished and not is_ready(s)` 表示输入已关闭且 buffer 已 drain 完，此时这条流"用完了"，立即被新流替换以维持稳态 B 条活跃。
+
+**单条 wall 定义**：`now - st.t_start`，其中 `t_start` 是 `_new_slot()` 创建该 slot 的瞬间。整段语义与 `decode_one_blocking` 的 `t0` 对齐——首片喂入到 drain 完成的真实墙钟。这也就是 **`latency_seconds.p95` 可以当 SLO 看的原因，不是 `batch_wall / batch_size` 那种摊销值**。
+
+**与 `batch` 的差别一图概括**：
+
+| 维度                  | `batch` (offline)             | `batch_streaming` (online)                                              |
+|-----------------------|-------------------------------|-------------------------------------------------------------------------|
+| 喂入节奏              | 一条流一次性喂完整段          | B 条流每 tick 各喂一片                                                  |
+| `decode_streams` 调用 | 喂完之后反复 drain 直到空     | 每 tick 一次（内含 drain 循环）；流之间始终保持"差不多一样多缓冲"        |
+| 单条延迟来源          | `batch_wall / B`（摊销）      | 真实 wall = chunk 数 × tick 时间 + 尾部 drain                            |
+| 适用结论              | 服务端凑齐 B 条音频后批解码   | 服务端 B 路实时麦克风共享 batch forward                                  |
+
+**pacing 语义**：和 `concurrent` 完全一致 ——
+
+- `realtime`：每 tick 等到 `chunk_seconds`，wall ≈ 音频时长 + 算力开销 + tick 调度抖动。`latency_seconds.p95` 是 SLO；若 `rtf_per_stream.p95 > 1.3`，说明缓冲在涨，再加路就会崩。
+- `full`：不 sleep，跑满 CPU 找吞吐拐点。`throughput_audio_per_wall` / `throughput_calls_per_sec` 是关键。
+
+### 3.6 四种模式音频路径对比
+
+| 阶段          | `single`                          | `concurrent` (`realtime`)                 | `batch`                                  | `batch_streaming` (`realtime`)             |
+|---------------|-----------------------------------|-------------------------------------------|------------------------------------------|--------------------------------------------|
+| 入口          | 主线程顺序取                      | N worker 从共享只读池循环取               | 主线程为本批构造 B 条 stream             | 主线程维持 B 条活跃 slot                   |
+| Spotter       | 1 个                              | **每线程 1 个**                           | 1 个共享                                 | **1 个共享**                               |
+| Stream 数     | 1                                 | N（每线程 1）                             | B（同一 spotter 持有）                   | B（同一 spotter 持有，稳态替换）           |
+| 节奏          | 全速喂                            | 每片 `sleep(len/sr)`                      | 全速喂完所有条                           | 每 tick 各喂一片 + `sleep(chunk_seconds)`  |
+| 算的时机      | 每片立刻 `decode_stream`          | 每片立刻 `decode_stream`                  | 全量喂入后 `decode_streams` 反复批算     | 每 tick 一次 `decode_streams(ready)`       |
+| 终止          | pool 跑完                         | `sleep(duration)` 到点                    | `n_batches` 跑完                         | `sleep(duration)` 到点                     |
+| 关键 metric   | `latency.p95` / `rtf.mean`        | `latency.p95` / `rtf_per_stream.p95`      | `throughput_calls_per_sec` / `batch_rtf` | `latency.p95` / `throughput_calls_per_sec` |
 
 ---
 
@@ -362,6 +413,18 @@ T = 0.062s  return wall = 0.062, audio_total = 24.0  (8 × 3s)
 | `per_call_latency_seconds.{mean,p50,p95}`  | 摊销延迟（**非用户等待**）                    |
 | `batch_rtf.mean`                           | 批音频总时长 / 批 wall                        |
 
+#### `batch_streaming`
+
+| 字段                                            | 含义                                                                              |
+|-------------------------------------------------|-----------------------------------------------------------------------------------|
+| `batch_size` / `pacing`                         | 配置（`batch_size` 由 `--concurrency` 传入；语义 = 稳态活跃 stream 数）           |
+| `duration_seconds`                              | 实际跑了多久                                                                      |
+| `n_calls_total` / `audio_seconds_total`         | 总完成流数 / 音频时长合计                                                         |
+| `throughput_audio_per_wall`                     | xRT（理论上限 `realtime` ≈ B，`full` 可远高）                                     |
+| `throughput_calls_per_sec`                      | 每秒完成调用数                                                                    |
+| `latency_seconds.{mean,p50,p90,p95,p99,max}`    | **单条端到端延迟分布（SLO 主指标）** —— 真实墙钟，非摊销值                        |
+| `rtf_per_stream.{mean,p50,p95}`                 | 单流 RTF；`realtime` 下 `> 1.3` 是危险信号（缓冲在涨）                            |
+
 ---
 
 ## 5. 使用方式
@@ -407,6 +470,11 @@ python sherpa_onnx_kws_perf.py ... \
 python sherpa_onnx_kws_perf.py ... \
     --mode batch --batch-size 16 --n-batches 20 \
     --scene batch_b16 --output-dir ...
+
+# batch_streaming（复用 concurrent 的参数：--concurrency 即 batch_size）
+python sherpa_onnx_kws_perf.py ... \
+    --mode batch_streaming --concurrency 8 --duration-seconds 30 --pacing realtime \
+    --scene batch_streaming_b8 --output-dir ...
 ```
 
 ---
@@ -417,16 +485,20 @@ python sherpa_onnx_kws_perf.py ... \
 |---------------------------------|---------------------------------------------------------------------|
 | 这块板子能跑实时吗              | `single_cpu1t` 的 `rtf.mean < 0.3` 较稳，`< 1` 才有可能              |
 | ORT 多线程加速比                | `single_cpu1t` vs `single_cpu4t` 的 `throughput_audio_per_wall`     |
-| 上线能开几路                    | `concurrent_cN` 扫一组，找 `latency.p95` 起拐点的 N（留 20% buffer）|
-| 服务端 batch 是否划算           | `batch_b8` vs `batch_b16` 的 `throughput_calls_per_sec` 增益是否值得 `per_call_latency` 的代价 |
+| 上线能开几路（独立实例部署）    | `concurrent_cN` 扫一组，找 `latency.p95` 起拐点的 N（留 20% buffer）|
+| 服务端 batch 吞吐上限           | `batch_b8` vs `batch_b16` 的 `throughput_calls_per_sec` 增益是否值得 `per_call_latency` 的代价 |
+| 服务端 B 路实时流的真实 SLO     | `batch_streaming_bN` 的 `latency_seconds.p95`（`pacing=realtime`），`rtf_per_stream.p95 > 1.3` 即危险 |
 
 ---
 
 ## 7. 设计取舍
 
-- **`concurrent` 每线程独立 spotter，`batch` 共享 spotter**
+- **`concurrent` 每线程独立 spotter，`batch` 与 `batch_streaming` 共享 spotter**
   - 真实多路部署每路是独立解码状态机；共享 spotter 但多 stream 与多实例的内存/缓存行为不同。
-  - `batch` 模式的加速正是要走 `decode_streams([...])`，必须共享。
+  - `batch` / `batch_streaming` 的加速正是要走 `decode_streams([...])`，必须共享同一个 spotter；差别在喂入节奏。
+- **`batch_streaming` 稳态替换 vs `batch` 凑批**
+  - `batch_streaming` 维持 B 条活跃 stream，任一条完成立即从音频池补一条（与 `concurrent` 稳态语义对齐），保证每个 tick 都有 ~B 条在并行 forward。
+  - `batch` 模式则是 B 条流一起开始、一起结束的 cohort 语义，凑批排队时间不计入 wall——所以它的延迟数据不能直接当 SLO 看。
 - **`_preload_pool` 把音频全量读入内存**
   - 把 I/O 从热路径剥离；样本数过大时受 RAM 限制，用 `--limit` 控。
 - **`_tail_padding` 缓存按采样率复用**（line 149-159）

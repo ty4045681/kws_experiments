@@ -3,9 +3,11 @@
 # sherpa_perf/run.sh —— sherpa-onnx KWS 推理性能测试一键脚本
 #
 # 用一个 SCENES 数组配置任意多个性能测试场景:
-#   - single        : 单线程顺序解码,测时延 / RTF
-#   - concurrent    : N 路并发 stream,测吞吐 / P95 延迟
-#   - batch         : decode_streams 批量解码,测 batch 吞吐
+#   - single          : 单线程顺序解码,测时延 / RTF
+#   - concurrent      : N 路并发 stream(每线程独立 spotter),测吞吐 / P95 延迟
+#   - batch           : decode_streams offline 批量解码,测 batch 吞吐上限
+#   - batch_streaming : B 条 stream 时间片交错喂入,共享 spotter 走 decode_streams,
+#                       测真实流式 batch 的 P95 延迟与吞吐(服务端语音网关场景)
 #
 # 每个场景产出一份 perf-<scene>-<backend>[-tag].json,直接落入上层脚手架
 # 的实验 metrics/ 目录,被 scripts/parse_perf.py 收纳。
@@ -14,10 +16,12 @@
 # 在脚本顶部 SCENES 数组按下面 5 段加场景:
 #   SCENES+=("scene|mode|arg1|arg2|tag")
 # 各 mode 的 arg 含义:
-#   single      arg1=<n_samples 限制,空=全部>  arg2=<num_threads(spotter)>
-#   concurrent  arg1=<concurrency>             arg2=<duration_seconds>
-#                                              并配合全局 PACING=full|realtime
-#   batch       arg1=<batch_size>              arg2=<n_batches>
+#   single          arg1=<n_samples 限制,空=全部>  arg2=<num_threads(spotter)>
+#   concurrent      arg1=<concurrency>             arg2=<duration_seconds>
+#                                                  并配合全局 PACING=full|realtime
+#   batch           arg1=<batch_size>              arg2=<n_batches>
+#   batch_streaming arg1=<concurrency=batch_size>  arg2=<duration_seconds>
+#                                                  并配合全局 PACING=full|realtime
 # tag 是可选后缀,合并进文件名,如 -realtime / -bs16
 #
 # ──────── 用法 ───────────────────────────────────────────────────────────
@@ -61,23 +65,33 @@ OUTPUT_DIR="../runs/exp001_baseline/metrics"
 # 格式: "scene|mode|arg1|arg2|tag"
 SCENES=()
 
-# 1) 单线程基线
+# 字段顺序: scene_name | mode | arg1 | arg2 | tag
+# 各 mode 的 arg1 / arg2 含义见上方"配置方式"注释。
+
+# 1) 单线程基线               arg1=limit(样本数=50)  arg2=num_threads(=1)
 SCENES+=("single_cpu1t|single|50|1|")
 
 # 2) 单实例 4 线程,看 ORT intra-op 加速
+#                             arg1=limit(=50)        arg2=num_threads(=4)
 SCENES+=("single_cpu4t|single|50|4|")
 
 # 3) 4 路并发(每路独立 spotter,各 1 线程)
+#                             arg1=concurrency(=4)   arg2=duration_seconds(=30)
 SCENES+=("concurrent_c4|concurrent|4|30|")
 
-# 4) 8 路并发
+# 4) 8 路并发                 arg1=concurrency(=8)   arg2=duration_seconds(=30)
 SCENES+=("concurrent_c8|concurrent|8|30|")
 
-# 5) batch_size=8 的批量解码
+# 5) batch_size=8 的批量解码  arg1=batch_size(=8)    arg2=n_batches(=20)
 SCENES+=("batch_b8|batch|8|20|")
 
-# 6) batch_size=16
+# 6) batch_size=16            arg1=batch_size(=16)   arg2=n_batches(=20)
 SCENES+=("batch_b16|batch|16|20|")
+
+# 7) 真实流式 batch (8 路并发,共享 spotter,decode_streams 批解码)
+#                             arg1=concurrency=batch_size(=8)
+#                             arg2=duration_seconds(=30)
+SCENES+=("batch_streaming_b8|batch_streaming|8|30|")
 
 # --- 只跑某个场景(命令行 --only)---
 ONLY=""
@@ -184,8 +198,17 @@ run_one_scene() {
           --num-threads "$NUM_THREADS_DEFAULT" \
           --batch-size "$bs" --n-batches "$nb"
       ;;
+    batch_streaming)
+      local conc="${a1:?需要 concurrency (= batch_size)}"
+      local dur="${a2:-30}"
+      echo "  [perf] $name batch_streaming  N=$conc  duration=${dur}s  pacing=$PACING"
+      "$PYTHON" sherpa_onnx_kws_perf.py \
+          "${common[@]}" --mode batch_streaming \
+          --num-threads "$NUM_THREADS_DEFAULT" \
+          --concurrency "$conc" --duration-seconds "$dur" --pacing "$PACING"
+      ;;
     *)
-      echo "[error] $name: 未知 mode='$mode' (single/concurrent/batch)"
+      echo "[error] $name: 未知 mode='$mode' (single/concurrent/batch/batch_streaming)"
       return 1
       ;;
   esac

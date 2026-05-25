@@ -418,6 +418,137 @@ def run_batch(kws, samples: List[Sample], chunk_seconds: float,
     }
 
 
+@dataclass
+class _StreamSlot:
+    """batch_streaming 的活跃 stream 槽位状态。"""
+    s: object
+    audio: np.ndarray
+    sr: int
+    dur: float
+    chunk: int
+    cursor: int = 0
+    tail_fed: bool = False
+    finished_input: bool = False
+    t_start: float = 0.0
+    pool_idx: int = 0
+
+
+def run_batch_streaming(kws, samples: List[Sample], chunk_seconds: float,
+                        batch_size: int, duration_seconds: float,
+                        pacing: str, warmup: int) -> dict:
+    """B 路并发 stream 时间片交错喂入,共享 spotter 走 decode_streams 批解码。
+
+    与 ``run_batch`` (offline batch) 的差别在于每个 tick 只给每条活跃 stream
+    喂一片 chunk,然后做一次 batch decode (drain 当前 ready 的 stream),
+    完成的 stream 立刻被新 stream 替换 —— 维持稳态 B 条活跃流。模拟服务端
+    B 路真实实时麦克风共享同一次 batch forward 的部署形态。
+
+    ``batch_size`` 复用 ``--concurrency`` 参数传入(语义 = 活跃 stream 数)。
+    端到端延迟按"单条流从首片喂入到 input_finished + drain 完成"统计,
+    可直接进 ``latency_seconds`` 作为 SLO 主指标 —— 而不是 ``run_batch``
+    的 ``batch_wall / batch_size`` 摊销值。
+    """
+    pool = _preload_pool(samples)
+    if not pool:
+        raise RuntimeError("manifest 中没有可用音频")
+    sr0 = pool[0][1]
+    chunk_sr0 = max(1, int(chunk_seconds * sr0))
+
+    next_idx = [0]
+
+    def _new_slot() -> _StreamSlot:
+        idx = next_idx[0]
+        next_idx[0] += 1
+        audio, sr, dur = pool[idx % len(pool)]
+        c = chunk_sr0 if sr == sr0 else max(1, int(chunk_seconds * sr))
+        return _StreamSlot(
+            s=kws.create_stream(),
+            audio=audio, sr=sr, dur=dur, chunk=c,
+            t_start=time.perf_counter(), pool_idx=idx,
+        )
+
+    active: List[_StreamSlot] = [_new_slot() for _ in range(batch_size)]
+
+    def _tick(out_records: Optional[List[PerCallRecord]]) -> int:
+        """跑一个 tick;返回本 tick 完成的 stream 数。"""
+        tick_start = time.perf_counter()
+        # (a) 每条 stream 喂一片 chunk / tail / input_finished
+        for st in active:
+            if st.cursor < len(st.audio):
+                seg = st.audio[st.cursor:st.cursor + st.chunk]
+                st.s.accept_waveform(st.sr, seg)
+                st.cursor += st.chunk
+            elif not st.tail_fed:
+                st.s.accept_waveform(st.sr, _tail_padding(st.sr))
+                st.tail_fed = True
+            elif not st.finished_input:
+                st.s.input_finished()
+                st.finished_input = True
+        # (b) 批解码:drain 所有 ready stream (复用 run_batch 的语义)
+        while True:
+            ready = [st.s for st in active if kws.is_ready(st.s)]
+            if not ready:
+                break
+            kws.decode_streams(ready)
+            for st in active:
+                r = kws.get_result(st.s)
+                if r:
+                    kws.reset_stream(st.s)
+        # (c) 回收 + 替换已完成 stream
+        completions = 0
+        for i, st in enumerate(active):
+            if st.finished_input and not kws.is_ready(st.s):
+                wall = time.perf_counter() - st.t_start
+                if out_records is not None:
+                    out_records.append(PerCallRecord(
+                        audio_seconds=st.dur, wall_seconds=wall,
+                        rtf=wall / st.dur if st.dur > 0 else 0.0,
+                    ))
+                active[i] = _new_slot()
+                completions += 1
+        # (d) realtime pacing:把本 tick 凑到 chunk_seconds
+        if pacing == "realtime":
+            remain = chunk_seconds - (time.perf_counter() - tick_start)
+            if remain > 0:
+                time.sleep(remain)
+        return completions
+
+    # 预热:先跑掉 warmup * batch_size 个完成,再 drain 当时仍在飞行的 slot,
+    # 保证进入主计时时所有 slot 都是温热路径下新建的。
+    if warmup > 0:
+        discarded = 0
+        target = warmup * batch_size
+        while discarded < target:
+            discarded += _tick(out_records=None)
+        in_flight = set(id(st) for st in active)
+        while any(id(st) in in_flight for st in active):
+            _tick(out_records=None)
+
+    # 主计时
+    records: List[PerCallRecord] = []
+    t0 = time.perf_counter()
+    deadline = t0 + duration_seconds
+    while time.perf_counter() < deadline:
+        _tick(out_records=records)
+    elapsed = time.perf_counter() - t0
+
+    audio_total = sum(r.audio_seconds for r in records)
+    walls = [r.wall_seconds for r in records]
+    rtfs = [r.rtf for r in records]
+    return {
+        "batch_size": batch_size,
+        "pacing": pacing,
+        "duration_seconds": round(elapsed, 4),
+        "n_calls_total": len(records),
+        "audio_seconds_total": round(audio_total, 4),
+        "throughput_audio_per_wall": round(audio_total / elapsed, 4) if elapsed > 0 else 0.0,
+        "throughput_calls_per_sec": round(len(records) / elapsed, 4) if elapsed > 0 else 0.0,
+        "latency_seconds": _latency_stats(walls),
+        "rtf_per_stream": _latency_stats(rtfs, with_p90=False, with_p99=False,
+                                         with_max=False),
+    }
+
+
 # ─── 环境信息 ──────────────────────────────────────────────────────────
 
 def env_info(args) -> dict:
@@ -471,7 +602,7 @@ def parse_args():
                    help="可选 tag,追加在文件名末尾,例 -c4 -b16")
     # 模式
     p.add_argument("--mode", required=True,
-                   choices=["single", "concurrent", "batch"])
+                   choices=["single", "concurrent", "batch", "batch_streaming"])
     # single 模式参数(已在通用里)
     # concurrent 模式参数
     p.add_argument("--concurrency", type=int, default=1)
@@ -514,6 +645,15 @@ def main():
         result = run_concurrent(_factory, samples, args.chunk_seconds,
                                 args.concurrency, args.duration_seconds,
                                 args.pacing, args.warmup)
+    elif args.mode == "batch_streaming":
+        # 共享单个 spotter,B 条 stream 时间片交错喂入 + decode_streams 批解码
+        kws = build_spotter(args)
+        result = run_batch_streaming(
+            kws, samples, args.chunk_seconds,
+            batch_size=args.concurrency,
+            duration_seconds=args.duration_seconds,
+            pacing=args.pacing, warmup=args.warmup,
+        )
     else:  # batch
         kws = build_spotter(args)
         result = run_batch(kws, samples, args.chunk_seconds,
@@ -550,6 +690,11 @@ def main():
         print(f"  RTF mean    : {r['rtf']['mean']:.3f}")
     elif args.mode == "concurrent":
         print(f"  concurrency : {r['concurrency']} ({r['pacing']})")
+        print(f"  calls/sec   : {r['throughput_calls_per_sec']:.2f}")
+        print(f"  audio xRT   : {r['throughput_audio_per_wall']:.2f}")
+        print(f"  latency P95 : {r['latency_seconds']['p95']:.3f}s")
+    elif args.mode == "batch_streaming":
+        print(f"  batch_size  : {r['batch_size']} ({r['pacing']})")
         print(f"  calls/sec   : {r['throughput_calls_per_sec']:.2f}")
         print(f"  audio xRT   : {r['throughput_audio_per_wall']:.2f}")
         print(f"  latency P95 : {r['latency_seconds']['p95']:.3f}s")
