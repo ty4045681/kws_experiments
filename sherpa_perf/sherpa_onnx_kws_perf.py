@@ -45,6 +45,7 @@ manifest 格式(与 sherpa_eval 完全相同)
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import platform
@@ -56,9 +57,25 @@ import time
 import wave
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set
 
 import numpy as np
+
+# psutil 用于运行时 CPU 采样(仅 cpu_sweep 模式需要)。延迟导入避免硬依赖。
+psutil = None
+
+
+def _ensure_psutil():
+    global psutil
+    if psutil is not None:
+        return psutil
+    try:
+        import psutil as _ps  # type: ignore
+    except ImportError:
+        print("[error] cpu_sweep 模式需要 psutil (pip install psutil)", file=sys.stderr)
+        raise
+    psutil = _ps
+    return psutil
 
 # sherpa_onnx 是运行依赖;这里延迟到实际创建 spotter 时再导入，
 # 这样 `--help` 和静态分析不会被拦住。
@@ -549,9 +566,114 @@ def run_batch_streaming(kws, samples: List[Sample], chunk_seconds: float,
     }
 
 
+# ─── CPU 采样 + 绑核 ───────────────────────────────────────────────────
+
+class _CpuSampler:
+    """后台线程定时采样当前进程的 CPU% 使用率。
+
+    口径(``mode``):
+      * ``per_core``: 归一化到"单核 100% = 1.0 个核"; 即 psutil 默认行为
+        (Linux 上 cpu_percent 上限 = cpu_count × 100)。
+        本类内不再归一化, 因为 psutil 已经返回这种值; 我们只是把含义说清楚。
+        实际语义: ``70`` 表示占用 0.7 个核; ``280`` 表示占用 2.8 个核。
+      * ``total``: 归一化到"全机所有核之和 = 100%"; 即除以 ``cpu_count``。
+        语义: ``70`` 表示占用了全机 70% 的算力。
+
+    采样位于后台线程, 不影响主线程时序。``stop()`` 后通过 ``stats()`` 取统计。
+    """
+
+    def __init__(self, mode: str = "per_core", interval: float = 0.2):
+        _ensure_psutil()
+        self.mode = mode
+        self.interval = interval
+        self.samples: List[float] = []
+        self._proc = psutil.Process(os.getpid())
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._cpu_count = os.cpu_count() or 1
+
+    def _loop(self):
+        # 首次 cpu_percent 调用返回 0.0 是预期 -- 它仅启动计时基线。
+        # 调用一次后丢弃。
+        self._proc.cpu_percent(interval=None)
+        while not self._stop.is_set():
+            if self._stop.wait(self.interval):
+                break
+            try:
+                v = self._proc.cpu_percent(interval=None)
+            except psutil.Error:
+                break
+            if self.mode == "total":
+                v = v / self._cpu_count
+            self.samples.append(v)
+
+    def start(self) -> "_CpuSampler":
+        self.samples = []
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> "_CpuSampler":
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        return self
+
+    def stats(self) -> dict:
+        if not self.samples:
+            return {"mean": 0.0, "p50": 0.0, "p95": 0.0, "max": 0.0, "n_samples": 0}
+        arr = np.asarray(self.samples, dtype=np.float64)
+        return {
+            "mean": round(float(arr.mean()), 2),
+            "p50": round(float(np.percentile(arr, 50)), 2),
+            "p95": round(float(np.percentile(arr, 95)), 2),
+            "max": round(float(arr.max()), 2),
+            "n_samples": int(arr.size),
+        }
+
+
+def _parse_affinity(spec: str) -> Set[int]:
+    """解析 '0' / '0-3' / '0,2,4' / '0-3,8,10-12' 为 core id set。"""
+    cores: Set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            cores.update(range(int(a), int(b) + 1))
+        else:
+            cores.add(int(part))
+    return cores
+
+
+def _apply_affinity(spec: Optional[str]) -> Optional[List[int]]:
+    """在当前进程上设置 CPU 亲和性。返回绑定的 core 列表; spec 为空返回 None。
+
+    Linux 用 ``os.sched_setaffinity``; 其它平台静默跳过并 warn(返回 None 表示未绑)。
+    """
+    if not spec:
+        return None
+    cores = _parse_affinity(spec)
+    if not cores:
+        return None
+    if not hasattr(os, "sched_setaffinity"):
+        print(f"[warn] 当前平台不支持 sched_setaffinity, --cpu-affinity '{spec}' 被忽略",
+              file=sys.stderr)
+        return None
+    try:
+        os.sched_setaffinity(0, cores)
+    except OSError as e:
+        print(f"[warn] sched_setaffinity 失败: {e}, --cpu-affinity '{spec}' 被忽略",
+              file=sys.stderr)
+        return None
+    return sorted(cores)
+
+
 # ─── 环境信息 ──────────────────────────────────────────────────────────
 
-def env_info(args) -> dict:
+def env_info(args, affinity_cores: Optional[List[int]] = None) -> dict:
     info = {
         "platform": platform.platform(),
         "python": platform.python_version(),
@@ -560,6 +682,13 @@ def env_info(args) -> dict:
         "num_threads": args.num_threads,
     }
     info["sherpa_onnx_version"] = getattr(sherpa_onnx, "__version__", "unknown") if sherpa_onnx else "unknown"
+    if affinity_cores is not None:
+        info["affinity_cores"] = affinity_cores
+    elif hasattr(os, "sched_getaffinity"):
+        try:
+            info["affinity_cores"] = sorted(os.sched_getaffinity(0))
+        except OSError:
+            pass
     try:
         with open("/proc/cpuinfo", "r") as f:
             for line in f:
@@ -569,6 +698,138 @@ def env_info(args) -> dict:
     except OSError:
         pass
     return info
+
+
+# ─── cpu_sweep:CPU 预算下的并发扫描 ────────────────────────────────────
+
+def _parse_concurrency_list(spec: str) -> List[int]:
+    """解析 '1,2,4,8,16,30,64' 为 int 列表; 去重后升序排序。"""
+    out: List[int] = []
+    seen: Set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        v = int(part)
+        if v <= 0:
+            raise ValueError(f"concurrency 必须 > 0, got {v}")
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    out.sort()
+    return out
+
+
+def run_cpu_sweep(args, samples: List[Sample], affinity_cores: Optional[List[int]]) -> dict:
+    """编排器:在 ``concurrency_list`` 每个点上跑一次内层模式 (concurrent 或
+    batch_streaming), 并发期间后台采样 CPU%, 汇总成 sweep_points。
+
+    复用 ``run_concurrent`` 与 ``run_batch_streaming`` -- 不重写并发逻辑。
+    ``samples`` 由调用方提供 (与其它模式入口一致), 内部由 run_concurrent/
+    run_batch_streaming 自行 _preload_pool (每次扫描点都重做; 池数据本身
+    是 numpy 浮点数组, decode 开销可忽略, 换得逻辑直接复用)。
+    """
+    conc_list = _parse_concurrency_list(args.concurrency_list)
+    inner_mode = args.inner_mode
+    budget_mode = args.cpu_budget_mode
+
+    # per_core 口径下,实际可用上限由绑核数决定;total 口径上限恒为 100
+    n_cores_avail = len(affinity_cores) if affinity_cores else (os.cpu_count() or 1)
+    cpu_upper = 100.0 * n_cores_avail if budget_mode == "per_core" else 100.0
+
+    sweep_points: List[dict] = []
+    for c in conc_list:
+        print(f"\n[cpu_sweep] concurrency={c}  inner_mode={inner_mode}  "
+              f"pacing={args.pacing}  duration={args.duration_seconds}s", flush=True)
+        sampler = _CpuSampler(mode=budget_mode).start()
+        try:
+            if inner_mode == "concurrent":
+                def _factory():
+                    return build_spotter(args)
+                result = run_concurrent(
+                    _factory, samples, args.chunk_seconds,
+                    concurrency=c, duration_seconds=args.duration_seconds,
+                    pacing=args.pacing, warmup=args.warmup,
+                )
+            elif inner_mode == "batch_streaming":
+                kws = build_spotter(args)
+                result = run_batch_streaming(
+                    kws, samples, args.chunk_seconds,
+                    batch_size=c, duration_seconds=args.duration_seconds,
+                    pacing=args.pacing, warmup=args.warmup,
+                )
+            else:
+                raise ValueError(f"未知 inner_mode: {inner_mode}")
+        finally:
+            sampler.stop()
+        cpu_stats = sampler.stats()
+        point = {
+            "concurrency": c,
+            "cpu_percent": cpu_stats,
+            "latency_seconds": result["latency_seconds"],
+            "rtf_per_stream": result.get("rtf_per_stream"),
+            "throughput_calls_per_sec": result["throughput_calls_per_sec"],
+            "throughput_audio_per_wall": result["throughput_audio_per_wall"],
+            "n_calls_total": result["n_calls_total"],
+        }
+        sweep_points.append(point)
+        print(f"  cpu_p95={cpu_stats['p95']:.1f}%  "
+              f"lat_p95={result['latency_seconds']['p95']:.3f}s  "
+              f"cps={result['throughput_calls_per_sec']:.2f}", flush=True)
+
+    # 满足 cpu_p95 <= target_cpu 的最大并发
+    under = [p["concurrency"] for p in sweep_points
+             if p["cpu_percent"]["p95"] <= args.target_cpu]
+    max_under = max(under) if under else 0
+    if not under:
+        print(f"[warn] 所有并发点的 cpu_p95 都超过 target_cpu={args.target_cpu}; "
+              f"max_concurrency_under_budget=0", file=sys.stderr)
+
+    return {
+        "inner_mode": inner_mode,
+        "target_cpu": args.target_cpu,
+        "cpu_budget_mode": budget_mode,
+        "cpu_upper_bound": cpu_upper,
+        "affinity_cores": affinity_cores,
+        "pacing": args.pacing,
+        "duration_seconds_per_point": args.duration_seconds,
+        "concurrency_list": conc_list,
+        "max_concurrency_under_budget": max_under,
+        "sweep_points": sweep_points,
+    }
+
+
+def _write_sweep_csv(csv_path: Path, sweep_points: List[dict]) -> None:
+    """把 sweep_points 扁平化到一行一个 csv, 便于 notebook 直接 read_csv 画图。"""
+    fields = [
+        "concurrency",
+        "cpu_mean", "cpu_p50", "cpu_p95", "cpu_max",
+        "lat_p50", "lat_p95", "lat_p99",
+        "rtf_p95",
+        "cps", "xrt",
+        "n_calls",
+    ]
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(fields)
+        for p in sweep_points:
+            lat = p["latency_seconds"]
+            rtf = p.get("rtf_per_stream") or {}
+            w.writerow([
+                p["concurrency"],
+                p["cpu_percent"]["mean"],
+                p["cpu_percent"]["p50"],
+                p["cpu_percent"]["p95"],
+                p["cpu_percent"]["max"],
+                lat.get("p50", 0.0),
+                lat.get("p95", 0.0),
+                lat.get("p99", 0.0),
+                rtf.get("p95", 0.0),
+                p["throughput_calls_per_sec"],
+                p["throughput_audio_per_wall"],
+                p["n_calls_total"],
+            ])
 
 
 # ─── 主入口 ────────────────────────────────────────────────────────────
@@ -602,16 +863,31 @@ def parse_args():
                    help="可选 tag,追加在文件名末尾,例 -c4 -b16")
     # 模式
     p.add_argument("--mode", required=True,
-                   choices=["single", "concurrent", "batch", "batch_streaming"])
+                   choices=["single", "concurrent", "batch", "batch_streaming",
+                            "cpu_sweep"])
     # single 模式参数(已在通用里)
     # concurrent 模式参数
     p.add_argument("--concurrency", type=int, default=1)
     p.add_argument("--duration-seconds", type=float, default=30.0,
-                   help="concurrent 模式持续时间")
+                   help="concurrent / batch_streaming / cpu_sweep 每点的持续时间")
     p.add_argument("--pacing", default="full", choices=["full", "realtime"])
     # batch 模式参数
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--n-batches", type=int, default=20)
+    # cpu_sweep 模式参数
+    p.add_argument("--inner-mode", default="concurrent",
+                   choices=["concurrent", "batch_streaming"],
+                   help="cpu_sweep 内层模式")
+    p.add_argument("--concurrency-list", default="1,2,4,8,16",
+                   help="cpu_sweep 要扫的并发点, 逗号分隔, 如 '1,2,4,8,16,30,64'")
+    p.add_argument("--target-cpu", type=float, default=70.0,
+                   help="cpu_sweep 的预算阈值(口径见 --cpu-budget-mode)")
+    p.add_argument("--cpu-budget-mode", default="per_core",
+                   choices=["per_core", "total"],
+                   help="per_core: 70 = 70%%/核 (上限 = 绑核数 × 100); "
+                        "total: 70 = 全机 CPU 的 70%%")
+    p.add_argument("--cpu-affinity", default="",
+                   help="Linux CPU 绑核, 例 '0' / '0-3' / '0,2,4'; 空 = 不绑")
     # 通用
     p.add_argument("--warmup", type=int, default=2,
                    help="预热次数(不计入统计)")
@@ -623,6 +899,12 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     _ensure_sherpa()
+
+    # 绑核(若指定);影响后续所有 worker 线程
+    affinity_cores = _apply_affinity(args.cpu_affinity) if args.cpu_affinity else None
+    if affinity_cores is not None:
+        print(f"[info] CPU affinity = {affinity_cores} ({len(affinity_cores)} cores)",
+              flush=True)
 
     print(f"[info] 加载 manifest: {args.manifest}", flush=True)
     samples = load_manifest(args.manifest, args.limit)
@@ -654,6 +936,8 @@ def main():
             duration_seconds=args.duration_seconds,
             pacing=args.pacing, warmup=args.warmup,
         )
+    elif args.mode == "cpu_sweep":
+        result = run_cpu_sweep(args, samples, affinity_cores)
     else:  # batch
         kws = build_spotter(args)
         result = run_batch(kws, samples, args.chunk_seconds,
@@ -667,7 +951,7 @@ def main():
         "chunk_seconds": args.chunk_seconds,
         "manifest": args.manifest,
         "n_manifest_samples": len(samples),
-        "env": env_info(args),
+        "env": env_info(args, affinity_cores=affinity_cores),
         "model": {
             "encoder": args.encoder,
             "keywords_threshold": args.keywords_threshold,
@@ -680,6 +964,13 @@ def main():
     out_path = out_dir / f"perf-{args.scene}-{args.suffix}{tag_part}.json"
     out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
     print(f"\n[done] 写入: {out_path}")
+
+    # cpu_sweep 额外写一份扁平 CSV,给 notebook 直接读
+    if args.mode == "cpu_sweep":
+        csv_path = out_dir / f"perf-{args.scene}-{args.suffix}{tag_part}.csv"
+        _write_sweep_csv(csv_path, result["sweep_points"])
+        print(f"[done] 写入: {csv_path}")
+
     # 打印关键指标摘要
     print("\n=== summary ===")
     r = result
@@ -698,6 +989,17 @@ def main():
         print(f"  calls/sec   : {r['throughput_calls_per_sec']:.2f}")
         print(f"  audio xRT   : {r['throughput_audio_per_wall']:.2f}")
         print(f"  latency P95 : {r['latency_seconds']['p95']:.3f}s")
+    elif args.mode == "cpu_sweep":
+        print(f"  inner_mode  : {r['inner_mode']} ({r['pacing']})")
+        print(f"  cpu_budget  : {r['target_cpu']:.1f}% ({r['cpu_budget_mode']}, "
+              f"upper={r['cpu_upper_bound']:.0f}%)")
+        print(f"  max_conc    : {r['max_concurrency_under_budget']} "
+              f"(<= target cpu_p95)")
+        print(f"  points      : {len(r['sweep_points'])}")
+        for p in r["sweep_points"]:
+            print(f"    c={p['concurrency']:>4d}  cpu_p95={p['cpu_percent']['p95']:>6.1f}%  "
+                  f"lat_p95={p['latency_seconds']['p95']:.3f}s  "
+                  f"cps={p['throughput_calls_per_sec']:.2f}")
     else:
         print(f"  batch_size  : {r['batch_size']}")
         print(f"  calls/sec   : {r['throughput_calls_per_sec']:.2f}")

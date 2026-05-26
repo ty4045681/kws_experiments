@@ -21,6 +21,7 @@ sherpa_perf/
 | `concurrent`      | 并发 N 路时尾延迟还稳吗？这台机器顶几路？                   | `latency_seconds.p95`、`rtf_per_stream.p95`         |
 | `batch`           | 服务端凑齐 B 条音频后批量推理，吞吐上限是多少？             | `throughput_calls_per_sec`、`batch_rtf`             |
 | `batch_streaming` | B 路真实实时流共享同一次 batch forward，单条 SLO 怎样？     | `latency_seconds.p95`、`throughput_calls_per_sec`   |
+| `cpu_sweep`       | 在 X% CPU(单核/多核)预算下，最多撑住多少路并发？画出曲线。  | `sweep_points[]`、`max_concurrency_under_budget`、配对 CSV |
 
 设计原则：**真实部署里每路通常是独立解码状态机**，所以 `concurrent` 给每个 worker 独立 `KeywordSpotter`；
 `batch` 与 `batch_streaming` 都要利用 sherpa-onnx 的 `decode_streams([...])` 批解码 API，必须共享同一个 spotter，差别只在喂入节奏：
@@ -477,6 +478,48 @@ python sherpa_onnx_kws_perf.py ... \
     --scene batch_streaming_b8 --output-dir ...
 ```
 
+### 5.5 `cpu_sweep`：CPU 预算下扫并发(Linux)
+
+在指定并发点列表上,对内层 `concurrent` 或 `batch_streaming` 各跑一次,后台用 `psutil` 采样进程 CPU%,
+输出 `perf-*.json` + 同名 `perf-*.csv`(供 `scripts/report.ipynb` 第 10/11 节画图)。
+
+```bash
+# 绑核 0-3，per_core 口径下 target=70%(即 70%/核;4 核上限 400%)
+python sherpa_onnx_kws_perf.py \
+    --tokens ... --encoder ... --decoder ... --joiner ... \
+    --keywords-file ... --manifest ... \
+    --mode cpu_sweep \
+    --inner-mode concurrent \
+    --concurrency-list "1,2,4,8,16,30,64" \
+    --target-cpu 70 \
+    --cpu-budget-mode per_core \
+    --cpu-affinity "0-3" \
+    --duration-seconds 30 \
+    --pacing realtime \
+    --num-threads 1 \
+    --scene cpu_sweep_c_core4 --tag t70_a0-3_d30 \
+    --output-dir ../runs/exp003_xxx/metrics
+```
+
+依赖:`pip install psutil`。绑核走 `os.sched_setaffinity`(仅 Linux 有效;其它平台 warn 后跳过)。
+
+`run.sh` 里加场景:
+
+```bash
+SCENES+=("cpu_sweep_c_core4|cpu_sweep|concurrent|1,2,4,8,16,30,64|t70_a0-3_d30")
+```
+
+tag 段语义(用 `_` 分段,可选):
+- `t<N>` → `--target-cpu N`(默认 70)
+- `a<S>` → `--cpu-affinity S`(如 `a0` / `a0-3` / `a0,2,4`)
+- `d<N>` → `--duration-seconds N`(每个并发点的时长,默认 30)
+- `b<M>` → `--cpu-budget-mode M`(`per_core`|`total`,默认 `per_core`)
+
+`cpu_budget_mode` 口径:
+- `per_core`:psutil 默认行为,单核 100% = 1 核;`target=70` 即 0.7 核;
+  绑 4 核时 CPU% 上限 = 400。
+- `total`:除以 `cpu_count`,`target=70` = 全机算力的 70%。
+
 ---
 
 ## 6. 决策指南
@@ -488,6 +531,7 @@ python sherpa_onnx_kws_perf.py ... \
 | 上线能开几路（独立实例部署）    | `concurrent_cN` 扫一组，找 `latency.p95` 起拐点的 N（留 20% buffer）|
 | 服务端 batch 吞吐上限           | `batch_b8` vs `batch_b16` 的 `throughput_calls_per_sec` 增益是否值得 `per_call_latency` 的代价 |
 | 服务端 B 路实时流的真实 SLO     | `batch_streaming_bN` 的 `latency_seconds.p95`（`pacing=realtime`），`rtf_per_stream.p95 > 1.3` 即危险 |
+| 给定 X% CPU 预算最高几路并发    | `cpu_sweep` 的 `max_concurrency_under_budget`，配 `scripts/report.ipynb` 第 10/11 节出曲线           |
 
 ---
 
@@ -509,3 +553,7 @@ python sherpa_onnx_kws_perf.py ... \
   - 跳过 ORT 首次推理的 cold-start，避免 P50 被首条拖偏；超大模型可调高。
 - **`pacing` 不影响 RTF 公式本身**
   - RTF 永远是 `wall / audio`；但 `realtime` 下 wall 包含 sleep，所以 RTF ≈ 1 + 算力开销 / 音频时长。
+- **`cpu_sweep` 是外层编排，不重写并发逻辑**
+  - 内部直接复用 `run_concurrent` / `run_batch_streaming`；只在外层加 `_CpuSampler`(后台线程 200ms 采样 `psutil.Process.cpu_percent`) 和并发点遍历。换内层算法不影响 CPU 采样。
+  - 绑核用 `os.sched_setaffinity`(Linux 原生)，记入 JSON `env.affinity_cores`；非 Linux 平台 warn 后跳过。
+  - `max_concurrency_under_budget` 用 `cpu_p95 ≤ target_cpu` 判定——p95 比 mean 更能反映尾部抖动是否压住核。

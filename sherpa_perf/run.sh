@@ -8,6 +8,8 @@
 #   - batch           : decode_streams offline 批量解码,测 batch 吞吐上限
 #   - batch_streaming : B 条 stream 时间片交错喂入,共享 spotter 走 decode_streams,
 #                       测真实流式 batch 的 P95 延迟与吞吐(服务端语音网关场景)
+#   - cpu_sweep       : 在指定并发点列表上扫描内层 concurrent / batch_streaming,
+#                       后台采样 CPU%,产 perf-*.json + perf-*.csv(供 notebook 画图)
 #
 # 每个场景产出一份 perf-<scene>-<backend>[-tag].json,直接落入上层脚手架
 # 的实验 metrics/ 目录,被 scripts/parse_perf.py 收纳。
@@ -22,6 +24,14 @@
 #   batch           arg1=<batch_size>              arg2=<n_batches>
 #   batch_streaming arg1=<concurrency=batch_size>  arg2=<duration_seconds>
 #                                                  并配合全局 PACING=full|realtime
+#   cpu_sweep       arg1=<inner_mode: concurrent|batch_streaming>
+#                   arg2=<concurrency_list: 逗号分隔, 如 "1,2,4,8,16,30,64">
+#                   tag 中可编码 cpu 预算与绑核(用 '_' 分段):
+#                     t<N>   : --target-cpu N    (默认 70)
+#                     a<S>   : --cpu-affinity S  (例 a0 / a0-3 / a0,2,4)
+#                     d<N>   : --duration-seconds N (每个并发点的持续时长, 默认 30)
+#                     b<M>   : --cpu-budget-mode M (per_core|total, 默认 per_core)
+#                   例: tag="t70_a0-3_d30" 表示 target=70% / 绑 0-3 / 每点 30s
 # tag 是可选后缀,合并进文件名,如 -realtime / -bs16
 #
 # ──────── 用法 ───────────────────────────────────────────────────────────
@@ -92,6 +102,14 @@ SCENES+=("batch_b16|batch|16|20|")
 #                             arg1=concurrency=batch_size(=8)
 #                             arg2=duration_seconds(=30)
 SCENES+=("batch_streaming_b8|batch_streaming|8|30|")
+
+# 8) CPU 预算扫描 - concurrent 内层, 绑 core 0-3, target 70%/核, 每点 30s
+#                             arg1=inner_mode(=concurrent)
+#                             arg2=concurrency_list(=1,2,4,8,16,30,64)
+#                             tag=t<target>_a<aff>_d<dur>_b<budget_mode>
+# SCENES+=("cpu_sweep_c_core4|cpu_sweep|concurrent|1,2,4,8,16,30,64|t70_a0-3_d30")
+# SCENES+=("cpu_sweep_bs_core4|cpu_sweep|batch_streaming|1,2,4,8,16,30,64|t70_a0-3_d30")
+# SCENES+=("cpu_sweep_c_core1|cpu_sweep|concurrent|1,2,4,8,16,30|t70_a0_d30")
 
 # --- 只跑某个场景(命令行 --only)---
 ONLY=""
@@ -207,8 +225,42 @@ run_one_scene() {
           --num-threads "$NUM_THREADS_DEFAULT" \
           --concurrency "$conc" --duration-seconds "$dur" --pacing "$PACING"
       ;;
+    cpu_sweep)
+      local inner="${a1:?需要 inner_mode (concurrent|batch_streaming)}"
+      local conc_list="${a2:?需要 concurrency_list (e.g. '1,2,4,8,16')}"
+      # 解析 tag: t<target>_a<affinity>_d<duration>_b<budget_mode>; 各段可选
+      local target_cpu="70"
+      local affinity=""
+      local dur="30"
+      local budget="per_core"
+      if [[ -n "$tag" ]]; then
+        IFS='_' read -ra _parts <<< "$tag"
+        for _p in "${_parts[@]}"; do
+          case "$_p" in
+            t*) target_cpu="${_p#t}" ;;
+            a*) affinity="${_p#a}" ;;
+            d*) dur="${_p#d}" ;;
+            b*) budget="${_p#b}" ;;
+          esac
+        done
+      fi
+      echo "  [perf] $name cpu_sweep  inner=$inner  conc_list=$conc_list  "\
+"target=${target_cpu}% (${budget})  aff=${affinity:-<none>}  dur=${dur}s  pacing=$PACING"
+      local aff_arg=()
+      [[ -n "$affinity" ]] && aff_arg=(--cpu-affinity "$affinity")
+      "$PYTHON" sherpa_onnx_kws_perf.py \
+          "${common[@]}" --mode cpu_sweep \
+          --num-threads 1 \
+          --inner-mode "$inner" \
+          --concurrency-list "$conc_list" \
+          --target-cpu "$target_cpu" \
+          --cpu-budget-mode "$budget" \
+          --duration-seconds "$dur" \
+          --pacing "$PACING" \
+          "${aff_arg[@]}"
+      ;;
     *)
-      echo "[error] $name: 未知 mode='$mode' (single/concurrent/batch/batch_streaming)"
+      echo "[error] $name: 未知 mode='$mode' (single/concurrent/batch/batch_streaming/cpu_sweep)"
       return 1
       ;;
   esac
