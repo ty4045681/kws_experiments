@@ -1,6 +1,13 @@
 # 单次实验配置模板。复制到 runs/expNNN_<name>/config.yaml 后修改。
-# 只用于"描述"这次实验,不会被 icefall 直接读取。
-# 解析脚本只用到 eval.* 和 meta.* 字段,其它字段都是给你自己看的。
+# 既可用于"描述"这次实验,也可由 scripts/run_from_config.py 直接驱动
+# sherpa-onnx 准确率评测、性能测试、入库与报告生成。
+# 注意:这份配置不会被 icefall 训练脚本直接读取。
+#
+# 配置项参考:
+#   python scripts/config_help.py
+#   python scripts/config_help.py eval.testsets
+#   python scripts/config_help.py perf.scenes
+# 完整文档见:CONFIG_REFERENCE.md
 
 meta:
   exp_id: exp000                # 由 new_experiment.py 自动填
@@ -10,6 +17,16 @@ meta:
   value: "5e-4"                 # 变量的取值(字符串)
   notes: ""                     # 自由备注:动机、特殊操作等
   ckpt_path: ""                 # 模型 checkpoint 路径(相对/绝对都可)
+
+# 可执行评测/性能测试所需的 sherpa-onnx 模型文件。
+# scripts/run_from_config.py 会读取这一段来替代手工修改 sherpa_eval/run.sh /
+# sherpa_perf/run.sh。相对路径默认相对项目根目录；也支持 ${ROOT}/${EXP_DIR}。
+model:
+  tokens: ""                    # 例: sherpa_eval/model/tokens.txt
+  encoder: ""                   # 例: sherpa_eval/model/encoder-...onnx
+  decoder: ""                   # 例: sherpa_eval/model/decoder-...onnx
+  joiner: ""                    # 例: sherpa_eval/model/joiner-...onnx
+  keywords_file: ""             # 例: sherpa_eval/model/keywords.txt
 
 # 训练阶段超参(沿用 icefall run.sh 的字段名,方便对照)
 train:
@@ -54,6 +71,49 @@ onnx:
 # negative_hours 是任意 testset 名 -> 负样本总时长(小时)的字典。
 # 评测脚本会优先读 negative_hours[testset];未命中时向后兼容 negative_hours_{testset}。
 eval:
+  # run_from_config.py 的准确率评测设置。
+  # manifest_dir 下会生成 <testset>.jsonl；默认也会被 REPORT.md 用于音频长度统计。
+  manifest_dir: sherpa_eval/data
+  suffix: onnx
+  provider: cpu
+  num_threads: 2
+  chunk_seconds: 0.5
+  keywords_threshold: 0.35      # 若留空,会回退到 decode.keywords_threshold
+  keywords_score: 1.0           # 若留空,会回退到 decode.keywords_score
+  limit: null                   # 调试时可填数字,只跑前 N 条
+  debug_lists: true             # false 时 metric 文件不写 TP/FP/FN 明细列表
+  test_only_keywords: false
+  phrase_space_to_underscore: true
+
+  # 阈值扫描: `python scripts/run_from_config.py <exp> --stage sweep`
+  # thresholds: ["0.20", "0.25", "0.30", "0.35", "0.40"]
+  thresholds: []
+
+  # 可执行测试集配置。mode 三选一:
+  #   transcript: audio_dir + transcript
+  #   auto-pair : audio_dir 下每个 wav 旁边有同名 .txt
+  #   fixed-text: audio_dir 下所有 wav 共用 text
+  # 也可以只填 manifest: /path/to/prebuilt.jsonl 并省略 mode/audio_dir。
+  testsets:
+    # - name: wakeword_pos
+    #   mode: fixed-text
+    #   audio_dir: /data/wakeword_pos
+    #   text: "lights on"
+    #   recursive: true
+    #   id_mode: relpath
+    #
+    # - name: car_noise
+    #   mode: transcript
+    #   audio_dir: /data/car_noise
+    #   transcript: /data/car_noise.text
+    #
+    # - name: kitchen
+    #   mode: auto-pair
+    #   audio_dir: /data/kitchen
+
+  # 准确率口径:用来把 FP 换算成 FA/hour
+  # negative_hours 是任意 testset 名 -> 负样本总时长(小时)的字典。
+  # 评测脚本会优先读 negative_hours[testset];未命中时向后兼容 negative_hours_{testset}。
   negative_hours:
     small: 40                   # icefall RESULTS.md 默认
     large: 23                   # icefall RESULTS.md 默认
@@ -61,8 +121,52 @@ eval:
     # mywakeword: 5.5
     # car_noise:  2.1
 
-# 性能测试(可选)。sherpa_perf/run.sh 产出的 perf-*.json 会被自动收集。
-# 以下字段仅作为实验记录使用，脚手架不会读取。
+# 性能测试(可选)。run_from_config.py 可直接读取 scenes 并调用 sherpa_perf。
+# 产物 perf-*.json 会被 parse_decode.py / parse_perf.py 自动收集。
 perf:
   hardware: ""                  # 说明跑测试的机器（例：Xeon 8358 32C / Jetson Orin Nano）
   notes: ""                     # 场景说明
+  suffix: onnx
+  provider: cpu
+  num_threads: 1
+  chunk_seconds: 0.5
+  warmup: 2
+  pacing: full                  # concurrent / batch_streaming / cpu_sweep 默认 pacing
+  duration_seconds: 30
+  # manifest/testset 是性能测试默认音频池；scene 内可覆盖。
+  # testset: wakeword_pos
+  # manifest: sherpa_eval/data/wakeword_pos.jsonl
+  scenes:
+    # - scene: single_cpu1t
+    #   mode: single
+    #   testset: wakeword_pos
+    #   num_threads: 1
+    #   limit: 100
+    #
+    # - scene: concurrent_c8
+    #   mode: concurrent
+    #   testset: wakeword_pos
+    #   concurrency: 8
+    #   duration_seconds: 30
+    #   pacing: realtime
+    #
+    # - scene: batch_b8
+    #   mode: batch
+    #   testset: wakeword_pos
+    #   batch_size: 8
+    #   n_batches: 20
+    #
+    # - scene: batch_streaming_b8
+    #   mode: batch_streaming
+    #   testset: wakeword_pos
+    #   concurrency: 8
+    #   duration_seconds: 30
+    #   pacing: realtime
+    #
+    # - scene: cpu_sweep_c
+    #   mode: cpu_sweep
+    #   testset: wakeword_pos
+    #   inner_mode: concurrent
+    #   concurrency_list: "1,2,4,8,16"
+    #   target_cpu: 70
+    #   cpu_budget_mode: per_core

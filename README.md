@@ -6,6 +6,8 @@
 - 支持**任意多个测试集**(small / large / 自定义场景集如 wakeword_pos /
   car_noise / kitchen / ...)
 - 支持**任意多个性能测试场景**(单流时延 / 多路并发 / 批量解码)
+- 支持**配置驱动执行**:每个实验的 `config.yaml` 可以直接驱动
+  manifest / eval / sweep / perf / 入库 / 报告,不用反复改 `run.sh`
 - 准确率 与 性能 在同一份 `REPORT.md` 与同一张 `registry.csv` 里并排展示
 
 ## 目录结构
@@ -13,6 +15,7 @@
 ```
 kws_experiments/
 ├── README.md                  # 本文件
+├── CONFIG_REFERENCE.md        # config.yaml 可配置项完整参考 ← 可由 config_help.py 生成
 ├── registry.csv               # 所有实验的一行式汇总(宽表) ← 自动生成
 ├── per_command.csv            # 每实验×每关键词的准确率长表 ← 自动生成
 ├── per_perf.csv               # 每实验×每场景的性能长表 ← 自动生成
@@ -30,6 +33,8 @@ kws_experiments/
 │       └── metrics.json       # 解析后的结构化指标(含 runs 与 perf_runs)
 ├── scripts/                   # 总入口
 │   ├── run.sh                 # 5 阶段总流程(新建/解析/入库/报告/重建)
+│   ├── run_from_config.py     # 从 runs/expXXX/config.yaml 直接驱动 eval/perf/入库/报告
+│   ├── config_help.py         # 查询/生成 config.yaml 配置项参考
 │   ├── new_experiment.py      # 新建一次实验目录
 │   ├── parse_decode.py        # metric-*.txt → metrics.json(顺便并 perf-*.json)
 │   ├── parse_perf.py          # 单独收集 perf-*.json → metrics.json
@@ -42,12 +47,130 @@ kws_experiments/
 │   ├── build_manifest.py
 │   └── README.md
 └── sherpa_perf/               # sherpa-onnx 性能测试端(独立可跑)
-    ├── run.sh                 # 多场景循环:single / concurrent / batch
+    ├── run.sh                 # 多场景循环:single/concurrent/batch/batch_streaming/cpu_sweep
     ├── sherpa_onnx_kws_perf.py
     └── README.md
 ```
 
 ## 完整工作流(每次新实验)
+
+### 方式 A:配置驱动(推荐)
+
+现在推荐把每次测试会变化的内容写进该实验自己的
+`runs/expNNN_<name>/config.yaml`,不要反复改 `sherpa_eval/run.sh` /
+`sherpa_perf/run.sh`。
+
+```bash
+# 1. 新建一次实验目录
+python scripts/new_experiment.py --name lr5e-5 --variable lr --value 5e-5
+
+# 2. 编辑 runs/expNNN_lr5e-5/config.yaml:
+#    - model.tokens / encoder / decoder / joiner / keywords_file
+#    - eval.testsets
+#    - eval.negative_hours
+#    - perf.scenes(可选)
+
+# 3. 一条命令跑 manifest → eval → perf → parse → register → report
+python scripts/run_from_config.py runs/expNNN_lr5e-5
+
+# 如果只想看会执行哪些命令,先 dry-run
+python scripts/run_from_config.py runs/expNNN_lr5e-5 --dry-run
+
+# 只跑准确率链路
+python scripts/run_from_config.py runs/expNNN_lr5e-5 \
+  --stage manifest,eval,parse,register,report
+
+# 只跑性能链路
+python scripts/run_from_config.py runs/expNNN_lr5e-5 \
+  --stage perf,parse,register,report
+
+# 只跑某个测试集 / 性能场景
+python scripts/run_from_config.py runs/expNNN_lr5e-5 \
+  --stage manifest,eval --only-testset car_noise
+python scripts/run_from_config.py runs/expNNN_lr5e-5 \
+  --stage perf --only-scene concurrent_c8
+```
+
+配置时如果忘了某个配置点支持哪些字段,可以直接查:
+
+```bash
+python scripts/config_help.py                  # 列出所有配置点
+python scripts/config_help.py model            # 模型字段
+python scripts/config_help.py eval.testsets    # 测试集字段/模式
+python scripts/config_help.py perf.scenes      # 性能场景字段/模式
+```
+
+完整字段参考见 `CONFIG_REFERENCE.md`;如果改了脚本里的字段说明,可重新生成:
+
+```bash
+python scripts/config_help.py --write CONFIG_REFERENCE.md
+```
+
+`config.yaml` 中可执行部分示例:
+
+```yaml
+model:
+  tokens: sherpa_eval/model/tokens.txt
+  encoder: sherpa_eval/model/encoder.onnx
+  decoder: sherpa_eval/model/decoder.onnx
+  joiner: sherpa_eval/model/joiner.onnx
+  keywords_file: sherpa_eval/model/keywords.txt
+
+eval:
+  manifest_dir: sherpa_eval/data
+  suffix: onnx
+  provider: cpu
+  num_threads: 2
+  chunk_seconds: 0.5
+  keywords_threshold: 0.35
+  keywords_score: 1.0
+  thresholds: ["0.20", "0.25", "0.30", "0.35"]
+  testsets:
+    - name: wakeword_pos
+      mode: fixed-text
+      audio_dir: /data/wakeword_pos
+      text: "lights on"
+    - name: car_noise
+      mode: transcript
+      audio_dir: /data/car_noise
+      transcript: /data/car_noise.text
+  negative_hours:
+    wakeword_pos: 0
+    car_noise: 2.1
+
+perf:
+  testset: wakeword_pos
+  scenes:
+    - scene: single_cpu1t
+      mode: single
+      num_threads: 1
+      limit: 100
+    - scene: concurrent_c8
+      mode: concurrent
+      concurrency: 8
+      duration_seconds: 30
+      pacing: realtime
+```
+
+支持的 stage:
+
+| stage | 作用 |
+|---|---|
+| `manifest` | 根据 `eval.testsets` 调 `sherpa_eval/build_manifest.py` |
+| `eval` | 根据 `eval.testsets` 调 `sherpa_eval/sherpa_onnx_kws_eval.py` |
+| `sweep` | 根据 `eval.thresholds` 做阈值扫描,产 `onnx-tXX` 指标 |
+| `perf` | 根据 `perf.scenes` 调 `sherpa_perf/sherpa_onnx_kws_perf.py` |
+| `parse` | 调 `scripts/parse_decode.py` 生成 `metrics.json` |
+| `register` | 调 `scripts/update_registry.py` 更新三张 CSV |
+| `report` | 调 `scripts/build_report.py` 生成 `REPORT.md` |
+
+`--stage all` 是默认值,等价于 `manifest,eval,perf,parse,register,report`;
+`--stage full` 会额外包含 `sweep`。
+
+路径约定:相对路径默认相对**项目根目录**,也可以使用 `${ROOT}` /
+`${EXP_DIR}` 占位。
+
+### 方式 B:手动产物收纳
 
 ```bash
 # 1. 新建一次实验目录(自动分配 expNNN)
@@ -77,8 +200,9 @@ python scripts/build_report.py
 或者一键串起来:
 
 ```bash
-scripts/run.sh --stage 0 --stop-stage 4
-# 0:new  1:parse(含 perf)  2:register  3:report  4:rebuild-all
+bash scripts/run.sh --stage 1 --stop-stage 1 --name lr5e-5
+bash scripts/run.sh --stage 2 --stop-stage 4 --exp-dir runs/expNNN_lr5e-5
+# 1:new  2:parse(含 perf)  3:register  4:report  5:rebuild-all
 ```
 
 完成后:
@@ -89,12 +213,17 @@ scripts/run.sh --stage 0 --stop-stage 4
 
 ## sherpa-onnx 端
 
+日常建议优先用上面的 `scripts/run_from_config.py`。下面两个目录仍然可以
+作为独立工具直接运行,也方便单独调试 manifest / eval / perf。
+
 - **评测**:`sherpa_eval/run.sh` 用 `TESTSETS` 数组循环跑多个测试集,
   每个产出 `metric-<testset>-onnx.txt`。详见 `sherpa_eval/README.md`。
 - **性能**:`sherpa_perf/run.sh` 用 `SCENES` 数组循环跑多个性能场景:
   - `single` — 单流时延 / RTF
   - `concurrent` — N 路并发(每线程独立 spotter),测吞吐 / P95 延迟
   - `batch` — `decode_streams` 批量解码,测服务端 batch 吞吐
+  - `batch_streaming` — B 路真实流式 batch,测共享 spotter 的尾延迟 / 吞吐
+  - `cpu_sweep` — 扫描并发点并采样 CPU%,估算预算内最大并发
 
   每个场景产出 `perf-<scene>-<backend>[-tag].json`。详见 `sherpa_perf/README.md`。
 

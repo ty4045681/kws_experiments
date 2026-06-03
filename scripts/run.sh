@@ -2,6 +2,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # scripts/run.sh —— 实验登记 / 入库 / 出报告的一键脚本
 #
+# 如果你希望把每次变化的模型路径、testset、perf scene 都写进
+# runs/expNNN_<name>/config.yaml，而不是反复改 shell 脚本，请优先使用:
+#   python scripts/run_from_config.py runs/expNNN_<name>
+#
 # 仿 icefall run.sh 的 stage 风格,按需跑某几步:
 #   stage 1 : 新建实验目录(分配 expNNN_<name>)
 #   stage 2 : 解析该实验 metrics/ 下的 metric-*.txt 与 perf-*.json
