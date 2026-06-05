@@ -1,0 +1,21 @@
+[project]
+name = "custom-wakeword-kws-experiments"
+version = "0.1.0"
+description = "KWS experiment scaffold for sherpa-onnx evaluation and performance reports."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "psutil",
+    "pyyaml",
+    "sherpa-onnx",
+]
+
+[project.optional-dependencies]
+notebook = [
+    "matplotlib",
+    "pandas",
+]
+
+[tool.uv]
+package = false
