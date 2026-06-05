@@ -15,6 +15,8 @@
 ```
 kws_experiments/
 ├── README.md                  # 本文件
+├── pyproject.toml             # Python/uv 依赖声明
+├── uv.lock                    # uv 锁文件,保证依赖可复现
 ├── CONFIG_REFERENCE.md        # config.yaml 可配置项完整参考 ← 可由 config_help.py 生成
 ├── registry.csv               # 所有实验的一行式汇总(宽表) ← 自动生成
 ├── per_command.csv            # 每实验×每关键词的准确率长表 ← 自动生成
@@ -52,6 +54,36 @@ kws_experiments/
     └── README.md
 ```
 
+## 环境准备(uv)
+
+本仓库使用 `pyproject.toml` + `uv.lock` 管理 Python 依赖。首次使用时在仓库
+根目录执行:
+
+```bash
+uv sync
+```
+
+这会安装运行评测和性能脚本所需的核心依赖:
+
+- `sherpa-onnx`: sherpa-onnx KWS 推理与评测
+- `numpy`: 音频数组和统计计算
+- `psutil`: `cpu_sweep` 性能场景的 CPU 采样
+- `pyyaml`: 优先用于读取 `config.yaml`；如果没有也有内置简化解析器兜底
+
+如果还要运行 `scripts/report.ipynb` 里的分析和可视化模板,安装 notebook
+可选依赖:
+
+```bash
+uv sync --extra notebook
+```
+
+常用脚本建议通过 `uv run` 执行,例如:
+
+```bash
+uv run python scripts/config_help.py
+uv run python scripts/run_from_config.py runs/expNNN_<name>
+```
+
 ## 完整工作流(每次新实验)
 
 ### 方式 A:配置驱动(推荐)
@@ -62,7 +94,7 @@ kws_experiments/
 
 ```bash
 # 1. 新建一次实验目录
-python scripts/new_experiment.py --name lr5e-5 --variable lr --value 5e-5
+uv run python scripts/new_experiment.py --name lr5e-5 --variable lr --value 5e-5
 
 # 2. 编辑 runs/expNNN_lr5e-5/config.yaml:
 #    - model.tokens / encoder / decoder / joiner / keywords_file
@@ -71,39 +103,39 @@ python scripts/new_experiment.py --name lr5e-5 --variable lr --value 5e-5
 #    - perf.scenes(可选)
 
 # 3. 一条命令跑 manifest → eval → perf → parse → register → report
-python scripts/run_from_config.py runs/expNNN_lr5e-5
+uv run python scripts/run_from_config.py runs/expNNN_lr5e-5
 
 # 如果只想看会执行哪些命令,先 dry-run
-python scripts/run_from_config.py runs/expNNN_lr5e-5 --dry-run
+uv run python scripts/run_from_config.py runs/expNNN_lr5e-5 --dry-run
 
 # 只跑准确率链路
-python scripts/run_from_config.py runs/expNNN_lr5e-5 \
+uv run python scripts/run_from_config.py runs/expNNN_lr5e-5 \
   --stage manifest,eval,parse,register,report
 
 # 只跑性能链路
-python scripts/run_from_config.py runs/expNNN_lr5e-5 \
+uv run python scripts/run_from_config.py runs/expNNN_lr5e-5 \
   --stage perf,parse,register,report
 
 # 只跑某个测试集 / 性能场景
-python scripts/run_from_config.py runs/expNNN_lr5e-5 \
+uv run python scripts/run_from_config.py runs/expNNN_lr5e-5 \
   --stage manifest,eval --only-testset car_noise
-python scripts/run_from_config.py runs/expNNN_lr5e-5 \
+uv run python scripts/run_from_config.py runs/expNNN_lr5e-5 \
   --stage perf --only-scene concurrent_c8
 ```
 
 配置时如果忘了某个配置点支持哪些字段,可以直接查:
 
 ```bash
-python scripts/config_help.py                  # 列出所有配置点
-python scripts/config_help.py model            # 模型字段
-python scripts/config_help.py eval.testsets    # 测试集字段/模式
-python scripts/config_help.py perf.scenes      # 性能场景字段/模式
+uv run python scripts/config_help.py                  # 列出所有配置点
+uv run python scripts/config_help.py model            # 模型字段
+uv run python scripts/config_help.py eval.testsets    # 测试集字段/模式
+uv run python scripts/config_help.py perf.scenes      # 性能场景字段/模式
 ```
 
 完整字段参考见 `CONFIG_REFERENCE.md`;如果改了脚本里的字段说明,可重新生成:
 
 ```bash
-python scripts/config_help.py --write CONFIG_REFERENCE.md
+uv run python scripts/config_help.py --write CONFIG_REFERENCE.md
 ```
 
 `config.yaml` 中可执行部分示例:
@@ -174,7 +206,7 @@ perf:
 
 ```bash
 # 1. 新建一次实验目录(自动分配 expNNN)
-python scripts/new_experiment.py --name lr5e-5 --variable lr --value 5e-5
+uv run python scripts/new_experiment.py --name lr5e-5 --variable lr --value 5e-5
 
 # 2. 跑你自己的训练 + decode(参考 icefall run.sh)
 #    把 metric-*.txt / perf-*.json 拷到该实验目录下,例如:
@@ -192,9 +224,9 @@ python scripts/new_experiment.py --name lr5e-5 --variable lr --value 5e-5
 # 3. 编辑该实验的 config.yaml,填入超参 / 训练备注 / 各 testset 的总时长
 
 # 4. 解析并入库(stage 2/3/4)
-python scripts/parse_decode.py runs/exp002_lr5e-5      # 同时收 perf-*.json
-python scripts/update_registry.py runs/exp002_lr5e-5
-python scripts/build_report.py
+uv run python scripts/parse_decode.py runs/exp002_lr5e-5      # 同时收 perf-*.json
+uv run python scripts/update_registry.py runs/exp002_lr5e-5
+uv run python scripts/build_report.py
 ```
 
 或者一键串起来:
