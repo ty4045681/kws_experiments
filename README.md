@@ -42,6 +42,8 @@ kws_experiments/
 │   ├── parse_perf.py          # 单独收集 perf-*.json → metrics.json
 │   ├── update_registry.py     # metrics.json → 三张 CSV
 │   ├── build_report.py        # CSV → REPORT.md(含性能章节)
+│   ├── bench_zipformer_streaming_onnx.py   # ONNX Runtime 流式 encoder 前向基准
+│   ├── bench_zipformer_streaming_mindir.py # MindSpore Lite 流式 encoder 前向基准
 │   └── report.ipynb           # 分析 / 可视化模板
 ├── sherpa_eval/               # sherpa-onnx 评测端(独立可跑)
 │   ├── run.sh                 # 多 testset 循环:build_manifest + eval
@@ -242,6 +244,37 @@ bash scripts/run.sh --stage 2 --stop-stage 4 --exp-dir runs/expNNN_lr5e-5
 - `REPORT.md` 自动出"准确率·总览"、"性能·总览"等章节
 - 打开 `scripts/report.ipynb` 看 Recall-FA 散点、Per-keyword 热力图,
   以及性能的并发扫描曲线、延迟分布图
+
+## 流式 Zipformer encoder 前向基准
+
+`scripts/bench_zipformer_streaming_onnx.py` 和
+`scripts/bench_zipformer_streaming_mindir.py` 用于直接测量已导出的 streaming
+Zipformer encoder。它们使用随机 fbank 特征，第一步将所有 cache 和
+`processed_lens` 置零，后续步骤将 `new_*` 输出状态回填为下一次输入。
+
+计时范围仅包含一次模型前向调用：ONNX Runtime 的 `session.run()` 或
+MindSpore Lite 的 `model.predict()`。特征窗口切片、输入设置、cache 回填和
+warmup 均不计入延迟。因此该结果用于比较 Python API 下的逐 chunk forward
+延迟，而不是端到端音频处理时间或纯 C++ kernel 时间。
+
+默认配置匹配 `chunk_size=16`、`left_context_frames=64` 的模型：单线程、绑定
+Linux CPU 0、warmup 20 步、计时 100 步。输入窗口为 39 帧 80 维 fbank；每步
+前移 32 帧，即 320 ms 音频。缓存将在第 4 步后填满。
+
+```bash
+# ONNX Runtime: requires onnxruntime in the active Python environment
+uv run --with onnxruntime python scripts/bench_zipformer_streaming_onnx.py \
+  --model /path/to/encoder.onnx
+
+# MindSpore Lite: install the platform-matched mindspore_lite package first
+uv run python scripts/bench_zipformer_streaming_mindir.py \
+  --model /path/to/encoder.mindir
+```
+
+常用可配置参数为 `--chunk-size`、`--left-context-frames`、`--warmup`、
+`--loops`、`--threads`、`--cpu` 和 `--no-cpu-bind`。脚本会校验 encoder 的输入
+窗口是否符合 `T = 2 * chunk_size + 7`；若导出模型的 chunk size 不同，必须通过
+`--chunk-size` 显式指定导出时的值。
 
 ## sherpa-onnx 端
 
