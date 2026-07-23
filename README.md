@@ -44,6 +44,7 @@ kws_experiments/
 │   ├── build_report.py        # CSV → REPORT.md(含性能章节)
 │   ├── bench_zipformer_streaming_onnx.py   # ONNX Runtime 流式 encoder 前向基准
 │   ├── bench_zipformer_streaming_mindir.py # MindSpore Lite 流式 encoder 前向基准
+│   ├── generate_zipformer_streaming_fixtures.py # 流式 encoder CLI 输入生成
 │   └── report.ipynb           # 分析 / 可视化模板
 ├── sherpa_eval/               # sherpa-onnx 评测端(独立可跑)
 │   ├── run.sh                 # 多 testset 循环:build_manifest + eval
@@ -275,6 +276,39 @@ uv run python scripts/bench_zipformer_streaming_mindir.py \
 `--loops`、`--threads`、`--cpu` 和 `--no-cpu-bind`。脚本会校验 encoder 的输入
 窗口是否符合 `T = 2 * chunk_size + 7`；若导出模型的 chunk size 不同，必须通过
 `--chunk-size` 显式指定导出时的值。
+
+### 生成 native CLI 输入 fixture
+
+`scripts/generate_zipformer_streaming_fixtures.py` 仅离线生成固定模型输入，
+不调用或适配 ONNX Runtime / MindSpore Lite 的 benchmark CLI。它以 Python API
+推进真实 state，并将每个 step 的完整输入按模型定义顺序写成 raw `.bin` 文件；
+后续可由本机版本对应的 CLI 工具自行加载。
+
+fixture 数量由 `ceil(left_context_frames / chunk_size) + 1` 决定。例如默认
+`chunk_size=16`、`left_context_frames=64` 时生成 5 组：`step_00_initial`、
+`step_01`、`step_02`、`step_03` 和 `step_04_steady`。第一组的 cache 和
+`processed_lens` 均为零；其余组使用上一轮模型 `new_*` 输出构造。若同时传入
+ONNX 和 MindIR 模型，两者共享同一随机种子产生的 fbank windows，但各自保存由
+对应 runtime 计算的 cache state。
+
+```bash
+# Generate inputs for either backend or both backends.
+uv run --with onnxruntime python scripts/generate_zipformer_streaming_fixtures.py \
+  --onnx-model /path/to/encoder.onnx \
+  --output-dir fixtures/zipformer-onnx
+
+# The active environment must provide both onnxruntime and mindspore_lite.
+uv run python scripts/generate_zipformer_streaming_fixtures.py \
+  --onnx-model /path/to/encoder.onnx \
+  --mindir-model /path/to/encoder.mindir \
+  --output-dir fixtures/zipformer-both
+```
+
+输出目录包含共享的 `features/*.npy`、每个 backend/step 的
+`input_<index>_<name>.bin`，以及 `manifest.json`。每个 backend 的 manifest
+entry 记录输入顺序、tensor 名称、dtype、shape、element count、byte size 和文件
+路径，因此可据此拼装任意 CLI 所要求的多输入参数。输出目录默认必须为空；需要
+复用目录时显式传入 `--overwrite`。
 
 ## sherpa-onnx 端
 
