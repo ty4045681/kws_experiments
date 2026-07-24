@@ -29,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True, help="Path to the MindIR encoder model.")
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size. Default: 1.")
     parser.add_argument("--feature-dim", type=int, default=80, help="Feature dimension. Default: 80.")
+    parser.add_argument("--input-frames", type=int, help="Feature input frame count. Required only when the model time dimension is dynamic.")
     parser.add_argument("--chunk-size", type=int, default=16, help="Encoder chunk size at 50 fps. Default: 16.")
     parser.add_argument("--left-context-frames", type=int, default=64, help="Left context at 50 fps. Default: 64.")
     parser.add_argument("--warmup", type=int, default=20, help="Number of stateful warmup calls. Default: 20.")
@@ -44,6 +45,8 @@ def parse_args() -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> None:
     if args.batch_size < 1 or args.feature_dim < 1 or args.chunk_size < 1:
         raise ValueError("batch-size, feature-dim, and chunk-size must be positive.")
+    if args.input_frames is not None and args.input_frames < 1:
+        raise ValueError("input-frames must be positive when provided.")
     if args.left_context_frames < 0 or args.warmup < 0 or args.loops < 1:
         raise ValueError("left-context-frames and warmup must be non-negative; loops must be positive.")
     if args.threads < 1 or args.cpu < 0:
@@ -88,14 +91,36 @@ def numpy_dtype(tensor: object) -> np.dtype:
     raise ValueError(f"Unsupported MindSpore Lite tensor type: {getattr(tensor, 'dtype')}")
 
 
+def positive_dimension(value: object) -> int:
+    try:
+        dimension = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return dimension if dimension > 0 else 0
+
+
+def resolve_input_frames(raw_shape: Sequence[int], requested: object) -> int:
+    shape = list(raw_shape)
+    if len(shape) != 3:
+        raise ValueError(f"Feature input must be rank 3, got {shape}.")
+    fixed = positive_dimension(shape[1])
+    if fixed:
+        if requested is not None and requested != fixed:
+            raise ValueError(f"Feature input has {fixed} frames, but --input-frames is {requested}.")
+        return fixed
+    if requested is None:
+        raise ValueError("Feature input time dimension is dynamic; provide --input-frames.")
+    return int(requested)
+
+
 def resolve_shape(raw_shape: Sequence[int], name: str, args: argparse.Namespace) -> List[int]:
     shape: List[int] = []
     for index, dimension in enumerate(raw_shape):
-        value = int(dimension)
-        if value > 0:
+        value = positive_dimension(dimension)
+        if value:
             shape.append(value)
-        elif is_feature_input(name):
-            shape.append((args.batch_size, 2 * args.chunk_size + 7, args.feature_dim)[index] if index < 3 else 1)
+        elif is_feature_input(name) and index < 3:
+            shape.append((args.batch_size, args.input_frames, args.feature_dim)[index])
         elif index == 0:
             shape.append(args.batch_size)
         else:
@@ -118,18 +143,14 @@ def get_feature_index(inputs: Sequence[object]) -> int:
     return indexes[0]
 
 
-def check_model_layout(inputs: Sequence[object], feature_index: int, args: argparse.Namespace) -> None:
+def check_model_layout(inputs: Sequence[object], feature_index: int, args: argparse.Namespace) -> int:
+    input_frames = resolve_input_frames(inputs[feature_index].shape, args.input_frames)
+    args.input_frames = input_frames
     feature_shape = resolve_shape(inputs[feature_index].shape, inputs[feature_index].name, args)
-    expected_frames = 2 * args.chunk_size + 7
-    if len(feature_shape) != 3:
-        raise ValueError(f"Feature input {inputs[feature_index].name} must be rank 3, got {feature_shape}.")
-    if feature_shape[1] != expected_frames:
-        raise ValueError(
-            f"Feature input has {feature_shape[1]} frames, but chunk-size {args.chunk_size} requires {expected_frames}. "
-            "Use the chunk size used to export this model."
-        )
-    if feature_shape[2] != args.feature_dim:
-        raise ValueError(f"Feature input has dimension {feature_shape[2]}, but --feature-dim is {args.feature_dim}.")
+    expected = [args.batch_size, input_frames, args.feature_dim]
+    if feature_shape != expected:
+        raise ValueError(f"Feature input shape is {feature_shape}; expected {expected}.")
+    return input_frames
 
 
 def reset_states(inputs: Sequence[object], feature_index: int, args: argparse.Namespace) -> None:
@@ -138,7 +159,7 @@ def reset_states(inputs: Sequence[object], feature_index: int, args: argparse.Na
             continue
         shape = resolve_shape(tensor.shape, tensor.name, args)
         if is_length_input(tensor.name):
-            values = np.full(shape, 2 * args.chunk_size + 7, dtype=numpy_dtype(tensor))
+            values = np.full(shape, args.input_frames, dtype=numpy_dtype(tensor))
         else:
             values = np.zeros(shape, dtype=numpy_dtype(tensor))
         tensor.set_data_from_numpy(values)
@@ -223,15 +244,17 @@ def main() -> None:
         context.cpu.enable_fp16 = args.enable_fp16
         model = mslite.Model()
         model.build_from_file(args.model, mslite.ModelType.MINDIR, context)
-        inputs = resize_dynamic_inputs(model, model.get_inputs(), args)
+        inputs = list(model.get_inputs())
         feature_index = get_feature_index(inputs)
-        check_model_layout(inputs, feature_index, args)
+        args.input_frames = resolve_input_frames(inputs[feature_index].shape, args.input_frames)
+        inputs = resize_dynamic_inputs(model, inputs, args)
+        feature_index = get_feature_index(inputs)
+        input_frames = check_model_layout(inputs, feature_index, args)
         print("[info] Model inputs:")
         for tensor in inputs:
             print(f"  {tensor.name}: shape={tensor.shape}, type={tensor.dtype}")
-        print(f"[info] chunk_size={args.chunk_size}, left_context_frames={args.left_context_frames}, warmup={args.warmup}, loops={args.loops}, threads={args.threads}, enable_fp16={args.enable_fp16}")
+        print(f"[info] input_frames={input_frames}, chunk_size={args.chunk_size}, left_context_frames={args.left_context_frames}, warmup={args.warmup}, loops={args.loops}, threads={args.threads}, enable_fp16={args.enable_fp16}")
 
-        input_frames = 2 * args.chunk_size + 7
         shift_frames = 2 * args.chunk_size
         total_frames = input_frames + (max(args.warmup, args.loops) - 1) * shift_frames
         features = np.random.default_rng(args.seed).standard_normal((total_frames, args.feature_dim), dtype=np.float32)

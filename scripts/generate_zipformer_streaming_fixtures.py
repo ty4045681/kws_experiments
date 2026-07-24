@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True, help="Directory for generated fixtures.")
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size. Default: 1.")
     parser.add_argument("--feature-dim", type=int, default=80, help="Feature dimension. Default: 80.")
+    parser.add_argument("--input-frames", type=int, help="Feature input frame count. Required only when the model time dimension is dynamic.")
     parser.add_argument("--chunk-size", type=int, default=16, help="Encoder chunk size at 50 fps. Default: 16.")
     parser.add_argument("--left-context-frames", type=int, default=64, help="Left context at 50 fps. Default: 64.")
     parser.add_argument("--threads", type=int, default=1, help="Runtime CPU thread count. Default: 1.")
@@ -48,6 +49,8 @@ def validate_args(args: argparse.Namespace) -> None:
             raise FileNotFoundError(f"Model file does not exist: {model}")
     if args.batch_size < 1 or args.feature_dim < 1 or args.chunk_size < 1 or args.threads < 1:
         raise ValueError("batch-size, feature-dim, chunk-size, and threads must be positive.")
+    if args.input_frames is not None and args.input_frames < 1:
+        raise ValueError("input-frames must be positive when provided.")
     if args.left_context_frames < 0:
         raise ValueError("left-context-frames must be non-negative.")
 
@@ -72,21 +75,40 @@ def case_name(step: int, fill_steps: int) -> str:
     return f"step_{step:02d}"
 
 
+def positive_dimension(value: Any) -> Optional[int]:
+    try:
+        dimension = int(value)
+    except (TypeError, ValueError):
+        return None
+    return dimension if dimension > 0 else None
+
+
+def resolve_model_input_frames(raw_shape: Sequence[Any], backend: str, requested: Optional[int]) -> int:
+    if len(raw_shape) != 3:
+        raise ValueError(f"{backend} feature input must be rank 3, got {list(raw_shape)}.")
+    fixed = positive_dimension(raw_shape[1])
+    if fixed is not None:
+        if requested is not None and requested != fixed:
+            raise ValueError(f"{backend} feature input has {fixed} frames, but --input-frames is {requested}.")
+        return fixed
+    if requested is None:
+        raise ValueError(f"{backend} feature input time dimension is dynamic; provide --input-frames.")
+    return requested
+
+
 def resolve_shape(raw_shape: Iterable[Any], name: str, args: argparse.Namespace) -> List[int]:
+    dimensions = list(raw_shape)
     result = []
-    for index, dimension in enumerate(raw_shape):
-        try:
-            value = int(dimension)
-        except (TypeError, ValueError):
-            value = 0
-        if value > 0:
+    for index, dimension in enumerate(dimensions):
+        value = positive_dimension(dimension)
+        if value is not None:
             result.append(value)
         elif is_feature_input(name) and index < 3:
-            result.append((args.batch_size, 2 * args.chunk_size + 7, args.feature_dim)[index])
+            result.append((args.batch_size, args.input_frames, args.feature_dim)[index])
         elif index == 0:
             result.append(args.batch_size)
         else:
-            raise ValueError(f"Cannot resolve dynamic dimension {index} of input {name}: {list(raw_shape)}")
+            raise ValueError(f"Cannot resolve dynamic dimension {index} of input {name}: {dimensions}")
     return result
 
 
@@ -110,11 +132,10 @@ def input_entry(index: int, name: str, array: np.ndarray, path: Path, root: Path
 
 
 def prepared_features(args: argparse.Namespace, fixture_count: int) -> List[np.ndarray]:
-    input_frames = 2 * args.chunk_size + 7
     shift_frames = 2 * args.chunk_size
-    total_frames = input_frames + (fixture_count - 1) * shift_frames
+    total_frames = args.input_frames + (fixture_count - 1) * shift_frames
     stream = np.random.default_rng(args.seed).standard_normal((total_frames, args.feature_dim), dtype=np.float32)
-    return [np.ascontiguousarray(stream[step * shift_frames:step * shift_frames + input_frames][None]) for step in range(fixture_count)]
+    return [np.ascontiguousarray(stream[step * shift_frames:step * shift_frames + args.input_frames][None]) for step in range(fixture_count)]
 
 
 def write_feature_windows(output_dir: Path, features: Sequence[np.ndarray], args: argparse.Namespace, fill_steps: int) -> List[str]:
@@ -143,6 +164,18 @@ def onnx_dtype(onnx_type: str) -> np.dtype:
         raise ValueError(f"Unsupported ONNX input type: {onnx_type}") from error
 
 
+def inspect_onnx_input_frames(args: argparse.Namespace) -> int:
+    try:
+        import onnxruntime as ort
+    except ImportError as error:
+        raise ImportError("Generating ONNX fixtures requires onnxruntime.") from error
+    session = ort.InferenceSession(args.onnx_model, providers=["CPUExecutionProvider"])
+    feature_inputs = [meta for meta in session.get_inputs() if is_feature_input(meta.name)]
+    if len(feature_inputs) != 1:
+        raise ValueError(f"Expected one ONNX feature input, found {[meta.name for meta in feature_inputs]}.")
+    return resolve_model_input_frames(feature_inputs[0].shape, "ONNX", args.input_frames)
+
+
 def onnx_initial_feed(session: Any, args: argparse.Namespace) -> Dict[str, np.ndarray]:
     feed = {}
     for meta in session.get_inputs():
@@ -150,7 +183,7 @@ def onnx_initial_feed(session: Any, args: argparse.Namespace) -> Dict[str, np.nd
             continue
         shape = resolve_shape(meta.shape, meta.name, args)
         dtype = onnx_dtype(meta.type)
-        feed[meta.name] = np.full(shape, 2 * args.chunk_size + 7, dtype=dtype) if is_length_input(meta.name) else np.zeros(shape, dtype=dtype)
+        feed[meta.name] = np.full(shape, args.input_frames, dtype=dtype) if is_length_input(meta.name) else np.zeros(shape, dtype=dtype)
     return feed
 
 
@@ -177,7 +210,7 @@ def check_onnx_layout(session: Any, args: argparse.Namespace) -> None:
     if len(feature_inputs) != 1:
         raise ValueError(f"Expected one ONNX feature input, found {[meta.name for meta in feature_inputs]}.")
     shape = resolve_shape(feature_inputs[0].shape, feature_inputs[0].name, args)
-    expected = [args.batch_size, 2 * args.chunk_size + 7, args.feature_dim]
+    expected = [args.batch_size, args.input_frames, args.feature_dim]
     if shape != expected:
         raise ValueError(f"ONNX feature input shape is {shape}; expected {expected}.")
 
@@ -254,6 +287,24 @@ def mindir_dtype(tensor: object) -> np.dtype:
     raise ValueError(f"Unsupported MindSpore Lite tensor type: {getattr(tensor, 'dtype')}")
 
 
+def inspect_mindir_input_frames(args: argparse.Namespace) -> int:
+    try:
+        import mindspore_lite as mslite
+    except ImportError as error:
+        raise ImportError("Generating MindIR fixtures requires mindspore_lite.") from error
+    context = mslite.Context()
+    context.target = ["cpu"]
+    context.cpu.thread_num = args.threads
+    context.cpu.enable_fp16 = False
+    model = mslite.Model()
+    model.build_from_file(args.mindir_model, mslite.ModelType.MINDIR, context)
+    inputs = model.get_inputs()
+    feature_inputs = [tensor for tensor in inputs if is_feature_input(tensor.name)]
+    if len(feature_inputs) != 1:
+        raise ValueError(f"Expected one MindIR feature input, found {[tensor.name for tensor in inputs]}.")
+    return resolve_model_input_frames(feature_inputs[0].shape, "MindIR", args.input_frames)
+
+
 def mindir_resize(model: object, inputs: Sequence[object], args: argparse.Namespace) -> List[object]:
     shapes = [resolve_shape(tensor.shape, tensor.name, args) for tensor in inputs]
     if any(list(tensor.shape) != shape for tensor, shape in zip(inputs, shapes)):
@@ -271,7 +322,7 @@ def mindir_feature_index(inputs: Sequence[object]) -> int:
 
 def check_mindir_layout(inputs: Sequence[object], feature_index: int, args: argparse.Namespace) -> None:
     shape = resolve_shape(inputs[feature_index].shape, inputs[feature_index].name, args)
-    expected = [args.batch_size, 2 * args.chunk_size + 7, args.feature_dim]
+    expected = [args.batch_size, args.input_frames, args.feature_dim]
     if shape != expected:
         raise ValueError(f"MindIR feature input shape is {shape}; expected {expected}.")
 
@@ -281,7 +332,7 @@ def mindir_reset_states(inputs: Sequence[object], feature_index: int, args: argp
         if index == feature_index:
             continue
         shape = resolve_shape(tensor.shape, tensor.name, args)
-        values = np.full(shape, 2 * args.chunk_size + 7, dtype=mindir_dtype(tensor)) if is_length_input(tensor.name) else np.zeros(shape, dtype=mindir_dtype(tensor))
+        values = np.full(shape, args.input_frames, dtype=mindir_dtype(tensor)) if is_length_input(tensor.name) else np.zeros(shape, dtype=mindir_dtype(tensor))
         tensor.set_data_from_numpy(values)
 
 
@@ -364,13 +415,23 @@ def main() -> None:
     args = parse_args()
     try:
         validate_args(args)
+        frame_counts = []
+        if args.onnx_model:
+            frame_counts.append(inspect_onnx_input_frames(args))
+            if args.input_frames is None:
+                args.input_frames = frame_counts[0]
+        if args.mindir_model:
+            frame_counts.append(inspect_mindir_input_frames(args))
+        if len(set(frame_counts)) != 1:
+            raise ValueError(f"ONNX and MindIR feature input frame counts differ: {frame_counts}.")
+        args.input_frames = frame_counts[0]
         output_dir = Path(args.output_dir).resolve()
         prepare_output_dir(output_dir, args.overwrite)
         fill_steps = math.ceil(args.left_context_frames / args.chunk_size)
         fixture_count = fill_steps + 1
         features = prepared_features(args, fixture_count)
         feature_files = write_feature_windows(output_dir, features, args, fill_steps)
-        print(f"[info] Generating {fixture_count} fixtures: initial plus {fill_steps} state-advance steps.")
+        print(f"[info] Generating {fixture_count} fixtures with input_frames={args.input_frames} and shift_frames={2 * args.chunk_size}: initial plus {fill_steps} state-advance steps.")
         backends = {}
         if args.onnx_model:
             backends["onnx"] = generate_onnx(output_dir, features, args, fill_steps)
@@ -384,6 +445,8 @@ def main() -> None:
             "configuration": {
                 "batch_size": args.batch_size,
                 "feature_dim": args.feature_dim,
+                "input_frames": args.input_frames,
+                "shift_frames": 2 * args.chunk_size,
                 "chunk_size": args.chunk_size,
                 "left_context_frames": args.left_context_frames,
                 "state_advance_steps": fill_steps,

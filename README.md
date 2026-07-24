@@ -259,8 +259,8 @@ warmup 均不计入延迟。因此该结果用于比较 Python API 下的逐 chu
 延迟，而不是端到端音频处理时间或纯 C++ kernel 时间。
 
 默认配置匹配 `chunk_size=16`、`left_context_frames=64` 的模型：单线程、绑定
-Linux CPU 0、warmup 20 步、计时 100 步。输入窗口为 39 帧 80 维 fbank；每步
-前移 32 帧，即 320 ms 音频。缓存将在第 4 步后填满。
+Linux CPU 0、warmup 20 步、计时 100 步。输入窗口帧数从模型固定 shape 自动读取；
+每步前移 32 帧，即 320 ms 音频。缓存将在第 4 步后填满。
 
 ```bash
 # ONNX Runtime: requires onnxruntime in the active Python environment
@@ -273,9 +273,9 @@ uv run python scripts/bench_zipformer_streaming_mindir.py \
 ```
 
 常用可配置参数为 `--chunk-size`、`--left-context-frames`、`--warmup`、
-`--loops`、`--threads`、`--cpu` 和 `--no-cpu-bind`。脚本会校验 encoder 的输入
-窗口是否符合 `T = 2 * chunk_size + 7`；若导出模型的 chunk size 不同，必须通过
-`--chunk-size` 显式指定导出时的值。
+`--loops`、`--threads`、`--cpu` 和 `--no-cpu-bind`。固定时间维模型会直接采用
+encoder 输入 shape 中的 `T`；若时间维是动态的，必须通过 `--input-frames` 指定。
+`--chunk-size` 仍须与模型导出配置一致，并决定每步前移的 fbank 帧数。
 
 ### 生成 native CLI 输入 fixture
 
@@ -307,8 +307,10 @@ uv run python scripts/generate_zipformer_streaming_fixtures.py \
 输出目录包含共享的 `features/*.npy`、每个 backend/step 的
 `input_<index>_<name>.bin`，以及 `manifest.json`。每个 backend 的 manifest
 entry 记录输入顺序、tensor 名称、dtype、shape、element count、byte size 和文件
-路径，因此可据此拼装任意 CLI 所要求的多输入参数。输出目录默认必须为空；需要
-复用目录时显式传入 `--overwrite`。
+路径，因此可据此拼装任意 CLI 所要求的多输入参数。输入窗口帧数优先从模型固定
+shape 读取；动态时间维模型需传 `--input-frames`。`shift_frames` 始终为
+`2 * chunk_size`，并与 `input_frames` 分别记录在 manifest。输出目录默认必须为空；
+需要复用目录时显式传入 `--overwrite`。
 
 ## sherpa-onnx 端
 
