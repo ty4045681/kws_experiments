@@ -45,6 +45,7 @@ kws_experiments/
 │   ├── bench_zipformer_streaming_onnx.py   # ONNX Runtime 流式 encoder 前向基准
 │   ├── bench_zipformer_streaming_mindir.py # MindSpore Lite 流式 encoder 前向基准
 │   ├── generate_zipformer_streaming_fixtures.py # 流式 encoder CLI 输入生成
+│   ├── bench_zipformer_streaming_onnx_fixtures.py # 基于 fixture 的 ONNX Python API 测试
 │   └── report.ipynb           # 分析 / 可视化模板
 ├── sherpa_eval/               # sherpa-onnx 评测端(独立可跑)
 │   ├── run.sh                 # 多 testset 循环:build_manifest + eval
@@ -311,6 +312,28 @@ entry 记录输入顺序、tensor 名称、dtype、shape、element count、byte 
 shape 读取；动态时间维模型需传 `--input-frames`。`shift_frames` 始终为
 `2 * chunk_size`，并与 `input_frames` 分别记录在 manifest。输出目录默认必须为空；
 需要复用目录时显式传入 `--overwrite`。
+
+### 基于 fixture 的 ONNX Python API 测试
+
+MindIR fixture 仍按上文用 MindSpore Lite `benchmark` CLI 测试。ONNX 侧则由
+`scripts/bench_zipformer_streaming_onnx_fixtures.py` 用 ONNX Runtime Python API
+直接加载 fixture：脚本读取 `manifest.json` 中 `backends.onnx` 的每个 step，从
+raw `.bin` 还原完整输入 feed（feature + cache state），逐 step 做
+warmup(默认 20) + 计时循环(默认 100)，只测量 `session.run()`，报告
+mean/std/min/p50/p90/p95/p99/max。计时结束后额外跑一次推理，把该 step 的全部
+输出写成 `output_<index>_<name>.bin`，并生成 `outputs_manifest.json`
+（含 dtype/shape/byte size 与每步延迟统计），可用于和 MindIR benchmark 的输出
+做数值精度对比。
+
+```bash
+uv run --with onnxruntime python scripts/bench_zipformer_streaming_onnx_fixtures.py \
+  --fixtures-dir fixtures/zipformer-onnx
+```
+
+模型路径默认取 manifest 中记录的 ONNX 模型，可用 `--model` 覆盖。输出默认写到
+`<fixtures-dir>/onnx_outputs`（非空时需 `--overwrite`）。线程与绑核参数
+（`--threads`、`--inter-op-threads`、`--cpu`/`--no-cpu-bind`）与
+`bench_zipformer_streaming_onnx.py` 一致。
 
 ## sherpa-onnx 端
 
