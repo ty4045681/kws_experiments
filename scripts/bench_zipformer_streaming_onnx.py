@@ -15,7 +15,7 @@ import statistics
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -36,6 +36,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--loops", type=int, default=100, help="Number of stateful benchmark calls. Default: 100.")
     parser.add_argument("--threads", type=int, default=1, help="ONNX Runtime intra-op thread count. Default: 1.")
     parser.add_argument("--inter-op-threads", type=int, default=1, help="ONNX Runtime inter-op thread count. Default: 1.")
+    parser.add_argument("--profile", action="store_true", help="Enable ONNX Runtime profiling. Disabled by default.")
+    parser.add_argument(
+        "--profile-prefix",
+        default=f"profiles/{Path(__file__).stem}",
+        help="Profile file prefix; ONNX Runtime appends a timestamp. Used only with --profile.",
+    )
     parser.add_argument("--cpu", type=int, default=0, help="CPU core to bind on Linux. Default: 0.")
     parser.add_argument("--no-cpu-bind", action="store_true", help="Do not bind the process to a CPU core.")
     parser.add_argument("--seed", type=int, default=42, help="Random feature seed. Default: 42.")
@@ -62,6 +68,25 @@ def bind_cpu(cpu: int) -> None:
         print(f"[info] Bound process to CPU {cpu}.")
     except OSError as error:
         print(f"[warning] Could not bind process to CPU {cpu}: {error}", file=sys.stderr)
+
+
+def configure_profiling(options: Any, enabled: bool, prefix: str) -> None:
+    if not enabled:
+        return
+    profile_prefix = Path(prefix).expanduser().resolve()
+    profile_prefix.parent.mkdir(parents=True, exist_ok=True)
+    options.enable_profiling = True
+    options.profile_file_prefix = str(profile_prefix)
+    print(f"[info] ONNX Runtime profiling enabled; prefix={profile_prefix}")
+    print("[warning] Profiling adds overhead; do not use this run as the baseline latency result.", file=sys.stderr)
+
+
+def finish_profiling(session: Any, enabled: bool) -> Optional[str]:
+    if not enabled:
+        return None
+    profile_path = str(Path(session.end_profiling()).resolve())
+    print(f"[info] Wrote ONNX Runtime profile: {profile_path}")
+    return profile_path
 
 
 def numpy_dtype(onnx_type: str) -> np.dtype:
@@ -238,6 +263,7 @@ def main() -> None:
         options.intra_op_num_threads = args.threads
         options.inter_op_num_threads = args.inter_op_threads
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        configure_profiling(options, args.profile, args.profile_prefix)
         session = ort.InferenceSession(args.model, sess_options=options, providers=["CPUExecutionProvider"])
         input_frames = check_model_layout(session, args)
         state_mapping = create_state_mapping(session)
@@ -268,6 +294,7 @@ def main() -> None:
             for input_name, output_index in state_mapping:
                 feed[input_name] = outputs[output_index]
 
+        finish_profiling(session, args.profile)
         print_summary(latencies_ms, args)
     except (FileNotFoundError, ImportError, ValueError, RuntimeError) as error:
         print(f"[error] {error}", file=sys.stderr)

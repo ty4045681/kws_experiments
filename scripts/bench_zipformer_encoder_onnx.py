@@ -30,7 +30,7 @@ import statistics
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -66,7 +66,32 @@ def _bind_cpu0() -> None:
         )
 
 
-def _build_session(encoder_path: str, intra_op: int, inter_op: int):
+def _configure_profiling(options: Any, enabled: bool, prefix: str) -> None:
+    if not enabled:
+        return
+    profile_prefix = Path(prefix).expanduser().resolve()
+    profile_prefix.parent.mkdir(parents=True, exist_ok=True)
+    options.enable_profiling = True
+    options.profile_file_prefix = str(profile_prefix)
+    print(f"[info] ONNX Runtime profiling enabled; prefix={profile_prefix}")
+    print("[warning] Profiling 会引入额外开销，请勿将本次结果作为基准时延", file=sys.stderr)
+
+
+def _finish_profiling(session: Any, enabled: bool) -> Optional[str]:
+    if not enabled:
+        return None
+    profile_path = str(Path(session.end_profiling()).resolve())
+    print(f"[info] 已写入 ONNX Runtime profile: {profile_path}")
+    return profile_path
+
+
+def _build_session(
+    encoder_path: str,
+    intra_op: int,
+    inter_op: int,
+    profile: bool,
+    profile_prefix: str,
+):
     """构造单线程 CPU 推理的 ONNX Runtime session。"""
     _ensure_ort()
     sess_opts = ort.SessionOptions()
@@ -74,6 +99,7 @@ def _build_session(encoder_path: str, intra_op: int, inter_op: int):
     sess_opts.intra_op_num_threads = intra_op
     sess_opts.inter_op_num_threads = inter_op
     sess_opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    _configure_profiling(sess_opts, profile, profile_prefix)
     return ort.InferenceSession(
         encoder_path,
         sess_options=sess_opts,
@@ -195,6 +221,7 @@ def _write_perf_json(
     out_path: Path,
     summary: Dict[str, Any],
     args: argparse.Namespace,
+    profile_path: Optional[str],
 ) -> None:
     """写成 sherpa_perf 风格的 perf JSON,便于被 scripts/parse_perf.py 收纳。"""
     payload = {
@@ -217,6 +244,8 @@ def _write_perf_json(
             "intra_op_num_threads": args.intra_op_num_threads,
             "inter_op_num_threads": args.inter_op_num_threads,
             "provider": "CPUExecutionProvider",
+            "profiling": args.profile,
+            "profile_file": profile_path,
         },
         "config": {
             "encoder": str(Path(args.encoder).resolve()),
@@ -250,6 +279,13 @@ def main() -> None:
                     help="ONNX Runtime intra_op 线程数(默认 1)")
     ap.add_argument("--inter-op-num-threads", type=int, default=1,
                     help="ONNX Runtime inter_op 线程数(默认 1)")
+    ap.add_argument("--profile", action="store_true",
+                    help="开启 ONNX Runtime profiling（默认关闭）")
+    ap.add_argument(
+        "--profile-prefix",
+        default=f"profiles/{Path(__file__).stem}",
+        help="profile 文件前缀；ORT 会追加时间戳，仅在 --profile 时使用",
+    )
     ap.add_argument("--no-cpu-bind", action="store_true",
                     help="跳过 CPU[0] 绑定(某些平台不支持)")
 
@@ -276,6 +312,8 @@ def main() -> None:
         args.encoder,
         args.intra_op_num_threads,
         args.inter_op_num_threads,
+        args.profile,
+        args.profile_prefix,
     )
     _inspect_inputs(session)
 
@@ -302,6 +340,7 @@ def main() -> None:
         session.run(None, inputs)
         times_ms.append((time.perf_counter() - t0) * 1000.0)
 
+    profile_path = _finish_profiling(session, args.profile)
     latency_ms = _format_latency_ms(times_ms)
     summary = {
         "latency_ms": latency_ms,
@@ -314,7 +353,7 @@ def main() -> None:
     _print_summary(summary)
 
     if args.output:
-        _write_perf_json(Path(args.output), summary, args)
+        _write_perf_json(Path(args.output), summary, args, profile_path)
 
 
 if __name__ == "__main__":
