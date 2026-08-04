@@ -3,9 +3,11 @@ r"""Convert a valid FP32 ONNX model to FP16 and validate the result.
 
 The converter uses ``onnxruntime.transformers.float16`` so existing
 ``Cast(to=FLOAT)`` nodes are updated consistently with FP16 value metadata.
-Both the source and converted models are checked with ONNX full type/shape
-inference. The converted model is written through a temporary file and moved
-to the requested destination only after all enabled checks pass.
+Cast nodes inserted around FP32-only operators are recursively and stably
+topologically sorted before validation. Both the source and converted models
+are checked with ONNX full type/shape inference. The converted model is written
+through a temporary file and moved to the requested destination only after all
+enabled checks pass.
 
 Example:
     uv run --with onnx==1.22.0 --with onnxruntime==1.28.0 \
@@ -21,16 +23,27 @@ inputs and outputs while internal floating-point computation uses FP16.
 from __future__ import annotations
 
 import argparse
+import heapq
 import os
 import sys
 import tempfile
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 
 MIN_FLOAT16_SUBNORMAL = 5.96e-08
 MAX_FLOAT16_FINITE = 65504.0
+
+
+@dataclass
+class TopologySortStats:
+    """Summary of recursive graph topology normalization."""
+
+    graphs_checked: int = 0
+    graphs_reordered: int = 0
+    nodes_repositioned: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -145,6 +158,147 @@ def import_dependencies() -> tuple[Any, Any, Any]:
     return onnx, ort, convert_float_to_float16
 
 
+def node_label(node: Any, index: int) -> str:
+    """Return a useful node label for diagnostics."""
+
+    return node.name or f"{node.op_type}[{index}]"
+
+
+def stable_topological_sort_graph(
+    graph: Any,
+    attribute_proto: Any,
+    stats: TopologySortStats,
+    graph_path: str,
+) -> None:
+    """Recursively put one GraphProto's nodes in stable topological order.
+
+    Dependencies are created only for values produced by nodes in the same
+    graph. Graph inputs, initializers, and values captured from an outer graph
+    therefore remain valid roots. Among nodes that are ready at the same time,
+    the original node index is used to preserve deterministic ordering.
+    """
+
+    stats.graphs_checked += 1
+    nodes = list(graph.node)
+
+    for node_index, node in enumerate(nodes):
+        parent_label = node_label(node, node_index)
+        for attribute in node.attribute:
+            if attribute.type == attribute_proto.GRAPH:
+                child_name = attribute.g.name or attribute.name or "<graph>"
+                stable_topological_sort_graph(
+                    attribute.g,
+                    attribute_proto,
+                    stats,
+                    f"{graph_path}/{parent_label}:{child_name}",
+                )
+            elif attribute.type == attribute_proto.GRAPHS:
+                for child_index, child_graph in enumerate(attribute.graphs):
+                    child_name = child_graph.name or f"{attribute.name}[{child_index}]"
+                    stable_topological_sort_graph(
+                        child_graph,
+                        attribute_proto,
+                        stats,
+                        f"{graph_path}/{parent_label}:{child_name}",
+                    )
+
+    if len(nodes) < 2:
+        return
+
+    producer_by_value: Dict[str, int] = {}
+    for producer_index, node in enumerate(nodes):
+        for output_name in node.output:
+            if not output_name:
+                continue
+            previous_index = producer_by_value.get(output_name)
+            if previous_index is not None:
+                raise RuntimeError(
+                    f"Cannot topologically sort {graph_path}: value "
+                    f"{output_name!r} is produced by both "
+                    f"{node_label(nodes[previous_index], previous_index)!r} and "
+                    f"{node_label(node, producer_index)!r}."
+                )
+            producer_by_value[output_name] = producer_index
+
+    indegrees = [0] * len(nodes)
+    consumers_by_producer = [[] for _ in nodes]
+    for consumer_index, node in enumerate(nodes):
+        dependencies = {
+            producer_by_value[input_name]
+            for input_name in node.input
+            if input_name in producer_by_value
+        }
+        indegrees[consumer_index] = len(dependencies)
+        for producer_index in dependencies:
+            consumers_by_producer[producer_index].append(consumer_index)
+
+    ready = [index for index, indegree in enumerate(indegrees) if indegree == 0]
+    heapq.heapify(ready)
+    sorted_indices = []
+    while ready:
+        producer_index = heapq.heappop(ready)
+        sorted_indices.append(producer_index)
+        for consumer_index in consumers_by_producer[producer_index]:
+            indegrees[consumer_index] -= 1
+            if indegrees[consumer_index] == 0:
+                heapq.heappush(ready, consumer_index)
+
+    if len(sorted_indices) != len(nodes):
+        blocked_nodes = [
+            node_label(nodes[index], index)
+            for index, indegree in enumerate(indegrees)
+            if indegree > 0
+        ]
+        preview = ", ".join(repr(name) for name in blocked_nodes[:10])
+        suffix = " ..." if len(blocked_nodes) > 10 else ""
+        raise RuntimeError(
+            f"Cannot topologically sort {graph_path}: detected a dependency "
+            f"cycle involving {preview}{suffix}."
+        )
+
+    original_indices = list(range(len(nodes)))
+    if sorted_indices == original_indices:
+        return
+
+    reordered_nodes = []
+    for original_index in sorted_indices:
+        node_copy = type(nodes[original_index])()
+        node_copy.CopyFrom(nodes[original_index])
+        reordered_nodes.append(node_copy)
+
+    del graph.node[:]
+    graph.node.extend(reordered_nodes)
+    stats.graphs_reordered += 1
+    stats.nodes_repositioned += sum(
+        original_index != new_index
+        for new_index, original_index in enumerate(sorted_indices)
+    )
+
+
+def stable_topological_sort_model(model: Any, onnx: Any) -> TopologySortStats:
+    """Recursively normalize node order in the model's main graph."""
+
+    stats = TopologySortStats()
+    graph_name = model.graph.name or "<main>"
+    stable_topological_sort_graph(
+        model.graph,
+        onnx.AttributeProto,
+        stats,
+        f"graph:{graph_name}",
+    )
+    return stats
+
+
+def validate_onnx_model(model_or_path: Any, label: str, onnx: Any) -> None:
+    """Run ONNX full validation and convert checker errors to concise output."""
+
+    try:
+        onnx.checker.check_model(model_or_path, full_check=True)
+    except Exception as error:
+        raise RuntimeError(f"{label} failed ONNX full_check: {error}") from error
+    print(f"[info] {label} passed ONNX full_check.")
+
+
 def tensor_type_name(value_info: Any, tensor_proto: Any) -> str:
     value_type = value_info.type
     if not value_type.HasField("tensor_type"):
@@ -223,10 +377,15 @@ def validate_runtime_model(model_path: Path, provider: str, ort: Any) -> None:
             f"Requested provider {provider!r} is unavailable; available providers: "
             f"{available_providers}"
         )
-    session = ort.InferenceSession(
-        str(model_path),
-        providers=[provider],
-    )
+    try:
+        session = ort.InferenceSession(
+            str(model_path),
+            providers=[provider],
+        )
+    except Exception as error:
+        raise RuntimeError(
+            f"ONNX Runtime session check failed with {provider}: {error}"
+        ) from error
     print(
         f"[info] ONNX Runtime session check passed with {provider}: "
         f"{len(session.get_inputs())} inputs, {len(session.get_outputs())} outputs."
@@ -252,8 +411,11 @@ def save_validated_model(
 
     try:
         onnx.save_model(model, str(temporary_path))
-        onnx.checker.check_model(str(temporary_path), full_check=True)
-        print("[info] Serialized FP16 model passed ONNX full_check.")
+        validate_onnx_model(
+            str(temporary_path),
+            "Serialized FP16 model",
+            onnx,
+        )
 
         if runtime_provider:
             validate_runtime_model(temporary_path, runtime_provider, ort)
@@ -275,21 +437,33 @@ def convert_model(args: argparse.Namespace) -> Path:
 
     print(f"[info] onnx={onnx.__version__}, onnxruntime={ort.__version__}")
     print(f"[info] Loading source model: {input_path}")
-    source_model = onnx.load(str(input_path))
-    onnx.checker.check_model(source_model, full_check=True)
-    print("[info] Source FP32 model passed ONNX full_check.")
+    try:
+        source_model = onnx.load(str(input_path))
+    except Exception as error:
+        raise RuntimeError(f"Could not load source ONNX model: {error}") from error
+    validate_onnx_model(source_model, "Source FP32 model", onnx)
     check_source_has_fp32(source_model, onnx)
     print_model_summary("source", source_model, onnx)
 
-    converted_model = convert_float_to_float16(
-        source_model,
-        min_positive_val=args.min_positive_val,
-        max_finite_val=args.max_finite_val,
-        keep_io_types=args.keep_io_types,
-        disable_shape_infer=args.disable_shape_infer,
+    try:
+        converted_model = convert_float_to_float16(
+            source_model,
+            min_positive_val=args.min_positive_val,
+            max_finite_val=args.max_finite_val,
+            keep_io_types=args.keep_io_types,
+            disable_shape_infer=args.disable_shape_infer,
+        )
+    except Exception as error:
+        raise RuntimeError(f"FP16 conversion failed: {error}") from error
+
+    topology_stats = stable_topological_sort_model(converted_model, onnx)
+    print(
+        "[info] Topological sort checked "
+        f"{topology_stats.graphs_checked} graph(s), reordered "
+        f"{topology_stats.graphs_reordered} graph(s), and repositioned "
+        f"{topology_stats.nodes_repositioned} node(s)."
     )
-    onnx.checker.check_model(converted_model, full_check=True)
-    print("[info] In-memory FP16 model passed ONNX full_check.")
+    validate_onnx_model(converted_model, "In-memory FP16 model", onnx)
     print_model_summary("converted", converted_model, onnx)
 
     save_validated_model(
