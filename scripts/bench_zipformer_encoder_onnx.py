@@ -91,6 +91,7 @@ def _build_session(
     inter_op: int,
     profile: bool,
     profile_prefix: str,
+    disable_optimizers: Optional[List[str]] = None,
 ):
     """构造单线程 CPU 推理的 ONNX Runtime session。"""
     _ensure_ort()
@@ -99,6 +100,13 @@ def _build_session(
     sess_opts.intra_op_num_threads = intra_op
     sess_opts.inter_op_num_threads = inter_op
     sess_opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    if disable_optimizers:
+        # 1.28.0 的 SessionOptions 没有 disabled_optimizers 属性；
+        # 通过 session config key 传入，1.19+ 均支持（分号分隔）。
+        sess_opts.add_session_config_entry(
+            "optimization.disable_specified_optimizers",
+            ";".join(disable_optimizers),
+        )
     _configure_profiling(sess_opts, profile, profile_prefix)
     return ort.InferenceSession(
         encoder_path,
@@ -244,6 +252,7 @@ def _write_perf_json(
             "intra_op_num_threads": args.intra_op_num_threads,
             "inter_op_num_threads": args.inter_op_num_threads,
             "provider": "CPUExecutionProvider",
+            "disabled_optimizers": list(args.disable_optimizer),
             "profiling": args.profile,
             "profile_file": profile_path,
         },
@@ -255,6 +264,7 @@ def _write_perf_json(
             "warmup": args.warmup,
             "iterations": args.iterations,
             "state_fill": args.state_fill,
+            "disabled_optimizers": list(args.disable_optimizer),
         },
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -289,6 +299,14 @@ def main() -> None:
     ap.add_argument("--no-cpu-bind", action="store_true",
                     help="跳过 CPU[0] 绑定(某些平台不支持)")
 
+    ap.add_argument(
+        "--disable-optimizer",
+        action="append",
+        default=[],
+        metavar="OPTIMIZER_NAME",
+        help="Disable a named ONNX Runtime graph optimizer. Repeatable; e.g. --disable-optimizer NhwcTransformer.",
+    )
+
     ap.add_argument("--output", help="输出 perf JSON 路径,例如 metrics/perf-encoder_single-onnx.json")
     ap.add_argument("--seed", type=int, default=42, help="随机种子(默认 42)")
 
@@ -314,7 +332,10 @@ def main() -> None:
         args.inter_op_num_threads,
         args.profile,
         args.profile_prefix,
+        args.disable_optimizer,
     )
+    if args.disable_optimizer:
+        print(f"[info] Disabled optimizers: {args.disable_optimizer}")
     _inspect_inputs(session)
 
     inputs = _make_inputs(

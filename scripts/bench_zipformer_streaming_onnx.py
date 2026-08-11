@@ -44,6 +44,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--cpu", type=int, default=0, help="CPU core to bind on Linux. Default: 0.")
     parser.add_argument("--no-cpu-bind", action="store_true", help="Do not bind the process to a CPU core.")
+    parser.add_argument(
+        "--disable-optimizer",
+        action="append",
+        default=[],
+        metavar="OPTIMIZER_NAME",
+        help="Disable a named ONNX Runtime graph optimizer. Repeatable; e.g. --disable-optimizer NhwcTransformer.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random feature seed. Default: 42.")
     return parser.parse_args()
 
@@ -263,8 +270,17 @@ def main() -> None:
         options.intra_op_num_threads = args.threads
         options.inter_op_num_threads = args.inter_op_threads
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        if args.disable_optimizer:
+            # 1.28.0 的 SessionOptions 没有 disabled_optimizers 属性；
+            # 通过 session config key 传入，1.19+ 均支持（分号分隔）。
+            options.add_session_config_entry(
+                "optimization.disable_specified_optimizers",
+                ";".join(args.disable_optimizer),
+            )
         configure_profiling(options, args.profile, args.profile_prefix)
         session = ort.InferenceSession(args.model, sess_options=options, providers=["CPUExecutionProvider"])
+        if args.disable_optimizer:
+            print(f"[info] Disabled optimizers: {args.disable_optimizer}")
         input_frames = check_model_layout(session, args)
         state_mapping = create_state_mapping(session)
         output_names = [meta.name for meta in session.get_outputs()]

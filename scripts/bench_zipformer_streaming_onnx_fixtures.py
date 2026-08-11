@@ -42,6 +42,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--cpu", type=int, default=0, help="CPU core to bind on Linux. Default: 0.")
     parser.add_argument("--no-cpu-bind", action="store_true", help="Do not bind the process to a CPU core.")
+    parser.add_argument(
+        "--disable-optimizer",
+        action="append",
+        default=[],
+        metavar="OPTIMIZER_NAME",
+        help="Disable a named ONNX Runtime graph optimizer. Repeatable; e.g. --disable-optimizer NhwcTransformer.",
+    )
     parser.add_argument("--output-dir", help="Directory for saved output tensors. Default: <fixtures-dir>/onnx_outputs.")
     parser.add_argument("--overwrite", action="store_true", help="Allow writing into a non-empty output directory.")
     return parser.parse_args()
@@ -200,8 +207,17 @@ def main() -> None:
         options.intra_op_num_threads = args.threads
         options.inter_op_num_threads = args.inter_op_threads
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        if args.disable_optimizer:
+            # 1.28.0 的 SessionOptions 没有 disabled_optimizers 属性；
+            # 通过 session config key 传入，1.19+ 均支持（分号分隔）。
+            options.add_session_config_entry(
+                "optimization.disable_specified_optimizers",
+                ";".join(args.disable_optimizer),
+            )
         configure_profiling(options, args.profile, args.profile_prefix)
         session = ort.InferenceSession(str(model_path), sess_options=options, providers=["CPUExecutionProvider"])
+        if args.disable_optimizer:
+            print(f"[info] Disabled optimizers: {args.disable_optimizer}")
         output_names = [meta.name for meta in session.get_outputs()]
         print(f"[info] Model: {model_path}")
         print(f"[info] Fixtures: {fixtures_dir} ({len(backend['fixtures'])} steps)")
@@ -229,6 +245,7 @@ def main() -> None:
                 "loops": args.loops,
                 "threads": args.threads,
                 "inter_op_threads": args.inter_op_threads,
+                "disabled_optimizers": list(args.disable_optimizer),
                 "profiling": args.profile,
                 "profile_file": profile_path,
             },
