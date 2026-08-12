@@ -3,7 +3,8 @@
 """
 用 ONNX Runtime 单独对 sherpa-onnx Zipformer encoder 做前向传播时延测试。
 
-绑定到 CPU[0]、单线程、CPU 推理，通过随机输入测 encoder 本身的推理延迟。
+默认绑定到 CPU[0] 并使用单线程 CPU EP，也可选择 CANN EP，通过随机输入测
+encoder 本身的推理延迟。
 
 典型用法:
     python scripts/bench_zipformer_encoder_onnx.py \
@@ -33,6 +34,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+
+from onnx_bench_provider import (
+    add_provider_arguments,
+    create_inference_session,
+    print_provider_metadata,
+)
 
 ort = None  # 延迟导入,让 --help 在不装 onnxruntime 时也能用
 
@@ -91,9 +98,10 @@ def _build_session(
     inter_op: int,
     profile: bool,
     profile_prefix: str,
+    args: argparse.Namespace,
     disable_optimizers: Optional[List[str]] = None,
 ):
-    """构造单线程 CPU 推理的 ONNX Runtime session。"""
+    """构造 ONNX Runtime session。"""
     _ensure_ort()
     sess_opts = ort.SessionOptions()
     sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -108,11 +116,7 @@ def _build_session(
             ";".join(disable_optimizers),
         )
     _configure_profiling(sess_opts, profile, profile_prefix)
-    return ort.InferenceSession(
-        encoder_path,
-        sess_options=sess_opts,
-        providers=["CPUExecutionProvider"],
-    )
+    return create_inference_session(ort, encoder_path, sess_opts, args)
 
 
 def _inspect_inputs(session) -> None:
@@ -230,8 +234,20 @@ def _write_perf_json(
     summary: Dict[str, Any],
     args: argparse.Namespace,
     profile_path: Optional[str],
+    provider_metadata: Dict[str, Any],
 ) -> None:
     """写成 sherpa_perf 风格的 perf JSON,便于被 scripts/parse_perf.py 收纳。"""
+    runtime = {
+        "onnxruntime_version": provider_metadata["onnxruntime_version"],
+        "available_providers": provider_metadata["available_providers"],
+        "requested_provider": provider_metadata["requested_provider"],
+        "requested_provider_options": provider_metadata[
+            "requested_provider_options"
+        ],
+        "session_providers": provider_metadata["session_providers"],
+        "session_provider_options": provider_metadata["session_provider_options"],
+        "cpu_fallback_enabled": provider_metadata["cpu_fallback_enabled"],
+    }
     payload = {
         "file": str(out_path),
         "scene": "encoder_single",
@@ -251,7 +267,8 @@ def _write_perf_json(
             "iterations": args.iterations,
             "intra_op_num_threads": args.intra_op_num_threads,
             "inter_op_num_threads": args.inter_op_num_threads,
-            "provider": "CPUExecutionProvider",
+            "provider": args.provider,
+            "runtime": runtime,
             "disabled_optimizers": list(args.disable_optimizer),
             "profiling": args.profile,
             "profile_file": profile_path,
@@ -264,6 +281,8 @@ def _write_perf_json(
             "warmup": args.warmup,
             "iterations": args.iterations,
             "state_fill": args.state_fill,
+            "provider": args.provider,
+            "runtime": runtime,
             "disabled_optimizers": list(args.disable_optimizer),
         },
     }
@@ -309,6 +328,7 @@ def main() -> None:
 
     ap.add_argument("--output", help="输出 perf JSON 路径,例如 metrics/perf-encoder_single-onnx.json")
     ap.add_argument("--seed", type=int, default=42, help="随机种子(默认 42)")
+    add_provider_arguments(ap)
 
     args = ap.parse_args()
 
@@ -326,14 +346,20 @@ def main() -> None:
     if not args.no_cpu_bind:
         _bind_cpu0()
 
-    session = _build_session(
-        args.encoder,
-        args.intra_op_num_threads,
-        args.inter_op_num_threads,
-        args.profile,
-        args.profile_prefix,
-        args.disable_optimizer,
-    )
+    try:
+        session, provider_metadata = _build_session(
+            args.encoder,
+            args.intra_op_num_threads,
+            args.inter_op_num_threads,
+            args.profile,
+            args.profile_prefix,
+            args,
+            args.disable_optimizer,
+        )
+    except (ValueError, RuntimeError) as error:
+        print(f"[error] {error}", file=sys.stderr)
+        raise SystemExit(1)
+    print_provider_metadata(provider_metadata)
     if args.disable_optimizer:
         print(f"[info] Disabled optimizers: {args.disable_optimizer}")
     _inspect_inputs(session)
@@ -368,13 +394,19 @@ def main() -> None:
         "iterations": args.iterations,
         "warmup": args.warmup,
         "platform": f"{platform.system()} {platform.machine()}",
-        "provider": "CPUExecutionProvider",
+        "provider": args.provider,
     }
 
     _print_summary(summary)
 
     if args.output:
-        _write_perf_json(Path(args.output), summary, args, profile_path)
+        _write_perf_json(
+            Path(args.output),
+            summary,
+            args,
+            profile_path,
+            provider_metadata,
+        )
 
 
 if __name__ == "__main__":

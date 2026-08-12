@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark a stateful streaming Zipformer ONNX encoder on CPU.
+"""Benchmark a stateful streaming Zipformer ONNX encoder with ONNX Runtime.
 
 Example:
     python scripts/bench_zipformer_streaming_onnx.py \
@@ -18,6 +18,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
+
+from onnx_bench_provider import (
+    add_provider_arguments,
+    create_inference_session,
+    print_provider_metadata,
+)
 
 
 FEATURE_INPUT_NAMES = {"x", "features", "feature", "feats"}
@@ -52,6 +58,7 @@ def parse_args() -> argparse.Namespace:
         help="Disable a named ONNX Runtime graph optimizer. Repeatable; e.g. --disable-optimizer NhwcTransformer.",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random feature seed. Default: 42.")
+    add_provider_arguments(parser)
     return parser.parse_args()
 
 
@@ -278,7 +285,13 @@ def main() -> None:
                 ";".join(args.disable_optimizer),
             )
         configure_profiling(options, args.profile, args.profile_prefix)
-        session = ort.InferenceSession(args.model, sess_options=options, providers=["CPUExecutionProvider"])
+        session, provider_metadata = create_inference_session(
+            ort,
+            args.model,
+            options,
+            args,
+        )
+        print_provider_metadata(provider_metadata)
         if args.disable_optimizer:
             print(f"[info] Disabled optimizers: {args.disable_optimizer}")
         input_frames = check_model_layout(session, args)

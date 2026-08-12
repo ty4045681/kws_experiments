@@ -25,6 +25,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from onnx_bench_provider import (
+    add_provider_arguments,
+    create_inference_session,
+    print_provider_metadata,
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -51,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", help="Directory for saved output tensors. Default: <fixtures-dir>/onnx_outputs.")
     parser.add_argument("--overwrite", action="store_true", help="Allow writing into a non-empty output directory.")
+    add_provider_arguments(parser)
     return parser.parse_args()
 
 
@@ -215,7 +222,13 @@ def main() -> None:
                 ";".join(args.disable_optimizer),
             )
         configure_profiling(options, args.profile, args.profile_prefix)
-        session = ort.InferenceSession(str(model_path), sess_options=options, providers=["CPUExecutionProvider"])
+        session, provider_metadata = create_inference_session(
+            ort,
+            str(model_path),
+            options,
+            args,
+        )
+        print_provider_metadata(provider_metadata)
         if args.disable_optimizer:
             print(f"[info] Disabled optimizers: {args.disable_optimizer}")
         output_names = [meta.name for meta in session.get_outputs()]
@@ -248,6 +261,19 @@ def main() -> None:
                 "disabled_optimizers": list(args.disable_optimizer),
                 "profiling": args.profile,
                 "profile_file": profile_path,
+                "onnxruntime_version": provider_metadata["onnxruntime_version"],
+                "available_providers": provider_metadata["available_providers"],
+                "requested_provider": provider_metadata["requested_provider"],
+                "requested_provider_options": provider_metadata[
+                    "requested_provider_options"
+                ],
+                "session_providers": provider_metadata["session_providers"],
+                "session_provider_options": provider_metadata[
+                    "session_provider_options"
+                ],
+                "cpu_fallback_enabled": provider_metadata[
+                    "cpu_fallback_enabled"
+                ],
             },
             "steps": steps,
         }

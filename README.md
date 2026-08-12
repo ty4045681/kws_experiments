@@ -273,6 +273,35 @@ uv run python scripts/bench_zipformer_streaming_mindir.py \
   --model /path/to/encoder.mindir
 ```
 
+三个 ONNX benchmark（`bench_zipformer_encoder_onnx.py`、
+`bench_zipformer_streaming_onnx.py` 和
+`bench_zipformer_streaming_onnx_fixtures.py`）都可通过 `--provider` 选择
+`CPUExecutionProvider`（默认）或 `CANNExecutionProvider`。普通 `onnxruntime`
+wheel 不含 CANN EP；在 CANN 8.5.1 服务器上应安装与该 Toolkit 匹配的
+`onnxruntime-cann` 或自行编译的 wheel，并先初始化环境：
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+
+uv run python scripts/bench_zipformer_streaming_onnx.py \
+  --model /path/to/encoder.onnx \
+  --provider CANNExecutionProvider \
+  --cann-device-id 0 \
+  --cann-precision-mode force_fp16 \
+  --cann-enable-graph
+```
+
+该命令默认允许不支持的节点回退到 CPU，适合先调通模型。确认全图能否下沉时增加
+`--cann-disable-cpu-fallback`；若有任一节点不受 CANN 支持，Session 创建会直接失败。
+`--cann-enable-subgraph` 可启用自动切分，`--cann-dump-graphs` 和
+`--cann-dump-om-model` 可用于检查编译结果。脚本输出的 Session Provider 列表只表示
+注册顺序，不证明每个节点都在 NPU 上执行，节点归属仍需结合 profiling 或 graph dump
+确认。开启 profiling 会扰动时延，不能把该次结果作为基准数据。
+
+当前 CANN 路径仍使用 `session.run()`，未启用 I/O Binding，因此计时包含 Host 与 NPU
+之间的输入输出传输。尤其对于逐 chunk 的小模型，应先验证下沉和正确性，再单独评估
+I/O Binding 下 state 常驻 NPU 的收益。
+
 常用可配置参数为 `--chunk-size`、`--left-context-frames`、`--warmup`、
 `--loops`、`--threads`、`--cpu` 和 `--no-cpu-bind`。固定时间维模型会直接采用
 encoder 输入 shape 中的 `T`；若时间维是动态的，必须通过 `--input-frames` 指定。
@@ -331,9 +360,10 @@ uv run --with onnxruntime python scripts/bench_zipformer_streaming_onnx_fixtures
 ```
 
 模型路径默认取 manifest 中记录的 ONNX 模型，可用 `--model` 覆盖。输出默认写到
-`<fixtures-dir>/onnx_outputs`（非空时需 `--overwrite`）。线程与绑核参数
-（`--threads`、`--inter-op-threads`、`--cpu`/`--no-cpu-bind`）与
-`bench_zipformer_streaming_onnx.py` 一致。
+`<fixtures-dir>/onnx_outputs`（非空时需 `--overwrite`）。线程、绑核、Provider 和
+CANN 参数与 `bench_zipformer_streaming_onnx.py` 一致；`outputs_manifest.json` 的
+`configuration` 会记录 ONNX Runtime 版本、请求/实际 Provider、CANN options 和
+CPU fallback 状态。
 
 ## sherpa-onnx 端
 
