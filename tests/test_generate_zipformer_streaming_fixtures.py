@@ -4,9 +4,12 @@ import argparse
 import contextlib
 import importlib.util
 import io
+import sys
 import unittest
 from pathlib import Path
-from typing import Any, List, Sequence
+from types import SimpleNamespace
+from typing import Any, List, Optional, Sequence
+from unittest import mock
 
 import numpy as np
 
@@ -82,6 +85,18 @@ class FakeMindIRTensor:
         self.dtype = dtype
 
 
+class FakeMindIRContext:
+    def __init__(self) -> None:
+        self.target: List[str] = []
+        self.cpu = SimpleNamespace(thread_num=None, precision_mode=None)
+        self.ascend = SimpleNamespace(device_id=None, precision_mode=None)
+
+
+class FakeMindSporeLite:
+    __version__ = "2.10.0"
+    Context = FakeMindIRContext
+
+
 def onnx_inputs() -> List[FakeOnnxMeta]:
     return [
         FakeOnnxMeta("x", [1, 10, 4]),
@@ -98,6 +113,91 @@ def mindir_inputs() -> List[FakeMindIRTensor]:
         FakeMindIRTensor("cache_a", [1, 2]),
         FakeMindIRTensor("cache_b", [1, 3]),
     ]
+
+
+def mindir_context_args(
+    device: str,
+    *,
+    precision_mode: Optional[str] = None,
+    device_id: int = 0,
+    threads: int = 2,
+) -> argparse.Namespace:
+    return argparse.Namespace(
+        mindir_device=device,
+        device_id=device_id,
+        ascend_precision_mode=precision_mode,
+        threads=threads,
+    )
+
+
+class MindIRDeviceCliTests(unittest.TestCase):
+    def test_parse_ascend_generation_options(self) -> None:
+        argv = [
+            str(GENERATOR_PATH),
+            "--mindir-model",
+            "encoder-ascend-oriented.mindir",
+            "--output-dir",
+            "fixtures/ascend",
+            "--mindir-device",
+            "ascend",
+            "--device-id",
+            "3",
+            "--ascend-precision-mode",
+            "enforce_fp16",
+        ]
+
+        with mock.patch.object(sys, "argv", argv):
+            args = generator.parse_args()
+
+        self.assertEqual(args.mindir_device, "ascend")
+        self.assertEqual(args.device_id, 3)
+        self.assertEqual(args.ascend_precision_mode, "enforce_fp16")
+
+    def test_cpu_context_remains_the_default(self) -> None:
+        context, metadata = generator.create_mindir_context(
+            FakeMindSporeLite,
+            mindir_context_args("cpu", threads=4),
+        )
+
+        self.assertEqual(context.target, ["cpu"])
+        self.assertEqual(context.cpu.thread_num, 4)
+        self.assertEqual(context.cpu.precision_mode, "enforce_fp32")
+        self.assertEqual(metadata["device"], "cpu")
+        self.assertIsNone(metadata["device_id"])
+        self.assertFalse(metadata["cpu_fallback_enabled"])
+
+    def test_ascend_context_sets_device_and_explicit_precision(self) -> None:
+        context, metadata = generator.create_mindir_context(
+            FakeMindSporeLite,
+            mindir_context_args(
+                "ascend",
+                precision_mode="enforce_fp16",
+                device_id=2,
+            ),
+        )
+
+        self.assertEqual(context.target, ["ascend"])
+        self.assertEqual(context.ascend.device_id, 2)
+        self.assertEqual(context.ascend.precision_mode, "enforce_fp16")
+        self.assertEqual(metadata["mindspore_lite_version"], "2.10.0")
+        self.assertEqual(metadata["requested_ascend_precision_mode"], "enforce_fp16")
+        self.assertEqual(metadata["context_ascend_precision_mode"], "enforce_fp16")
+        self.assertIsNone(metadata["expected_runtime_default_ascend_precision_mode"])
+        self.assertTrue(metadata["cpu_fallback_enabled"])
+
+    def test_npu_alias_and_unspecified_precision_preserve_runtime_default(self) -> None:
+        context, metadata = generator.create_mindir_context(
+            FakeMindSporeLite,
+            mindir_context_args("npu", precision_mode=None),
+        )
+
+        self.assertEqual(context.target, ["ascend"])
+        self.assertIsNone(context.ascend.precision_mode)
+        self.assertEqual(metadata["device"], "ascend")
+        self.assertEqual(
+            metadata["expected_runtime_default_ascend_precision_mode"],
+            "enforce_fp16",
+        )
 
 
 class PreparedFeaturesTests(unittest.TestCase):

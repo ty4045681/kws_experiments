@@ -6,6 +6,12 @@ Example:
         --onnx-model path/to/encoder.onnx \
         --mindir-model path/to/encoder.mindir \
         --output-dir fixtures/zipformer
+
+    python scripts/generate_zipformer_streaming_fixtures.py \
+        --mindir-model path/to/encoder-ascend-oriented.mindir \
+        --mindir-device ascend --device-id 0 \
+        --ascend-precision-mode enforce_fp16 \
+        --output-dir fixtures/zipformer-ascend
 """
 
 from __future__ import annotations
@@ -23,6 +29,13 @@ import numpy as np
 
 FEATURE_INPUT_NAMES = {"x", "features", "feature", "feats"}
 LENGTH_INPUT_NAMES = {"x_lens", "lengths", "lens"}
+ASCEND_PRECISION_MODES = (
+    "enforce_fp32",
+    "preferred_fp32",
+    "enforce_fp16",
+    "enforce_origin",
+    "preferred_optimal",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,12 +49,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-size", type=int, default=16, help="Encoder chunk size at 50 fps. Default: 16.")
     parser.add_argument("--left-context-frames", type=int, default=64, help="Left context at 50 fps. Default: 64.")
     parser.add_argument("--threads", type=int, default=1, help="Runtime CPU thread count. Default: 1.")
+    parser.add_argument(
+        "--mindir-device",
+        choices=("cpu", "ascend", "npu"),
+        default="cpu",
+        help="Device used to advance MindIR state; npu is an alias for ascend. Default: cpu.",
+    )
+    parser.add_argument(
+        "--device-id",
+        type=int,
+        default=0,
+        help="Ascend device ID used for MindIR fixture generation. Default: 0.",
+    )
+    parser.add_argument(
+        "--ascend-precision-mode",
+        choices=ASCEND_PRECISION_MODES,
+        help=(
+            "Ascend runtime precision mode used while generating MindIR state. "
+            "Keep it consistent with converter_lite; omitting it leaves the runtime default unchanged."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random feature seed. Default: 42.")
     parser.add_argument("--overwrite", action="store_true", help="Allow writing into a non-empty output directory.")
     return parser.parse_args()
 
 
+def normalize_mindir_device(device: str) -> str:
+    return "ascend" if device == "npu" else device
+
+
 def validate_args(args: argparse.Namespace) -> None:
+    args.mindir_device = normalize_mindir_device(args.mindir_device)
     if not args.onnx_model and not args.mindir_model:
         raise ValueError("At least one of --onnx-model or --mindir-model is required.")
     for model in (args.onnx_model, args.mindir_model):
@@ -49,10 +87,22 @@ def validate_args(args: argparse.Namespace) -> None:
             raise FileNotFoundError(f"Model file does not exist: {model}")
     if args.batch_size < 1 or args.feature_dim < 1 or args.chunk_size < 1 or args.threads < 1:
         raise ValueError("batch-size, feature-dim, chunk-size, and threads must be positive.")
+    if args.device_id < 0:
+        raise ValueError("device-id must be non-negative.")
     if args.input_frames is not None and args.input_frames < 1:
         raise ValueError("input-frames must be positive when provided.")
     if args.left_context_frames < 0:
         raise ValueError("left-context-frames must be non-negative.")
+    if not args.mindir_model:
+        if args.mindir_device != "cpu" or args.device_id != 0 or args.ascend_precision_mode is not None:
+            raise ValueError(
+                "--mindir-device, --device-id, and --ascend-precision-mode require --mindir-model."
+            )
+    elif args.mindir_device == "cpu":
+        if args.device_id != 0:
+            raise ValueError("--device-id requires --mindir-device ascend.")
+        if args.ascend_precision_mode is not None:
+            raise ValueError("--ascend-precision-mode requires --mindir-device ascend.")
 
 
 def is_feature_input(name: str) -> bool:
@@ -307,15 +357,61 @@ def mindir_dtype(tensor: object) -> np.dtype:
     raise ValueError(f"Unsupported MindSpore Lite tensor type: {getattr(tensor, 'dtype')}")
 
 
+def set_mindir_cpu_precision(cpu_context: Any) -> str:
+    """Keep host execution and Ascend CPU fallback in FP32."""
+    if hasattr(cpu_context, "precision_mode"):
+        try:
+            cpu_context.precision_mode = "enforce_fp32"
+            return "enforce_fp32"
+        except (AttributeError, RuntimeError, ValueError):
+            pass
+    if hasattr(cpu_context, "enable_fp16"):
+        cpu_context.enable_fp16 = False
+        return "enforce_fp32"
+    raise RuntimeError("This MindSpore Lite Context exposes no CPU precision setting.")
+
+
+def create_mindir_context(mslite: Any, args: argparse.Namespace) -> Tuple[Any, Dict[str, Any]]:
+    device = normalize_mindir_device(args.mindir_device)
+    context = mslite.Context()
+    context.cpu.thread_num = args.threads
+    cpu_precision_mode = set_mindir_cpu_precision(context.cpu)
+    context.target = [device]
+
+    context_precision = None
+    if device == "ascend":
+        context.ascend.device_id = args.device_id
+        if args.ascend_precision_mode is not None:
+            context.ascend.precision_mode = args.ascend_precision_mode
+        context_precision = getattr(context.ascend, "precision_mode", None)
+
+    raw_target = getattr(context, "target", [device])
+    target = [raw_target] if isinstance(raw_target, str) else list(raw_target)
+    metadata = {
+        "mindspore_lite_version": str(getattr(mslite, "__version__", "unknown")),
+        "device": device,
+        "target": target,
+        "device_id": args.device_id if device == "ascend" else None,
+        "threads": args.threads,
+        "cpu_precision_mode": cpu_precision_mode,
+        "requested_ascend_precision_mode": args.ascend_precision_mode,
+        "context_ascend_precision_mode": context_precision,
+        "expected_runtime_default_ascend_precision_mode": (
+            "enforce_fp16"
+            if device == "ascend" and args.ascend_precision_mode is None
+            else None
+        ),
+        "cpu_fallback_enabled": device == "ascend",
+    }
+    return context, metadata
+
+
 def inspect_mindir_input_frames(args: argparse.Namespace) -> int:
     try:
         import mindspore_lite as mslite
     except ImportError as error:
         raise ImportError("Generating MindIR fixtures requires mindspore_lite.") from error
-    context = mslite.Context()
-    context.target = ["cpu"]
-    context.cpu.thread_num = args.threads
-    context.cpu.enable_fp16 = False
+    context, _ = create_mindir_context(mslite, args)
     model = mslite.Model()
     model.build_from_file(args.mindir_model, mslite.ModelType.MINDIR, context)
     inputs = model.get_inputs()
@@ -408,10 +504,7 @@ def generate_mindir(output_dir: Path, features: Sequence[np.ndarray], args: argp
         import mindspore_lite as mslite
     except ImportError as error:
         raise ImportError("Generating MindIR fixtures requires mindspore_lite.") from error
-    context = mslite.Context()
-    context.target = ["cpu"]
-    context.cpu.thread_num = args.threads
-    context.cpu.enable_fp16 = False
+    context, generation_context = create_mindir_context(mslite, args)
     model = mslite.Model()
     model.build_from_file(args.mindir_model, mslite.ModelType.MINDIR, context)
     inputs = mindir_resize(model, model.get_inputs(), args)
@@ -434,6 +527,7 @@ def generate_mindir(output_dir: Path, features: Sequence[np.ndarray], args: argp
     return {
         "backend": "mindir",
         "model": str(Path(args.mindir_model).resolve()),
+        "generation_context": generation_context,
         "input_order": [tensor.name for tensor in inputs],
         "fixtures": fixtures,
     }
@@ -449,6 +543,13 @@ def main() -> None:
     args = parse_args()
     try:
         validate_args(args)
+        if args.mindir_model and args.mindir_device == "ascend" and args.ascend_precision_mode is None:
+            print(
+                "[warning] --ascend-precision-mode was not specified; the MindSpore "
+                "Lite runtime default is left unchanged. For reproducible fixtures, pass "
+                "the mode used by converter_lite (its default is enforce_fp16).",
+                file=sys.stderr,
+            )
         frame_counts = []
         if args.onnx_model:
             frame_counts.append(inspect_onnx_input_frames(args))
@@ -472,7 +573,10 @@ def main() -> None:
             print(f"[info] Wrote ONNX fixtures to {output_dir / 'onnx'}.")
         if args.mindir_model:
             backends["mindir"] = generate_mindir(output_dir, features, args, fill_steps)
-            print(f"[info] Wrote MindIR fixtures to {output_dir / 'mindir'}.")
+            print(
+                f"[info] Wrote MindIR fixtures to {output_dir / 'mindir'} "
+                f"using {args.mindir_device}."
+            )
         manifest = {
             "format_version": 1,
             "generator": Path(__file__).name,

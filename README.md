@@ -333,6 +333,15 @@ uv run python scripts/generate_zipformer_streaming_fixtures.py \
   --onnx-model /path/to/encoder.onnx \
   --mindir-model /path/to/encoder.mindir \
   --output-dir fixtures/zipformer-both
+
+# 直接在 NPU 上加载 ascend_oriented MindIR，并用 NPU 输出推进 cache state。
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+uv run python scripts/generate_zipformer_streaming_fixtures.py \
+  --mindir-model /path/to/encoder-ascend-oriented.mindir \
+  --mindir-device ascend \
+  --device-id 0 \
+  --ascend-precision-mode enforce_fp16 \
+  --output-dir fixtures/zipformer-ascend-fp16
 ```
 
 输出目录包含共享的 `features/*.npy`、每个 backend/step 的
@@ -342,6 +351,13 @@ entry 记录输入顺序、tensor 名称、dtype、shape、element count、byte 
 shape 读取；动态时间维模型需传 `--input-frames`。`shift_frames` 始终为
 `2 * chunk_size`，并与 `input_frames` 分别记录在 manifest。输出目录默认必须为空；
 需要复用目录时显式传入 `--overwrite`。
+
+MindIR fixture 默认仍在 CPU 上生成。`--mindir-device ascend`（`npu` 是别名）会在
+指定 NPU 上执行每一步，并将 NPU 产生的 cache/state 写入后续 fixture；运行前必须加载
+CANN 环境。`--ascend-precision-mode` 应与 `converter_lite` 的 `precision_mode` 一致。
+如果不传，脚本不会覆盖 runtime 默认值，但会告警；manifest 的
+`backends.mindir.generation_context` 会记录生成设备、device ID、请求/Context 精度模式
+和 MindSpore Lite 版本，便于区分 CPU 与 NPU state 快照。
 
 ### 基于 fixture 的 Python API 测试
 
@@ -392,10 +408,11 @@ Ascend 输出分别默认写到 `<fixtures-dir>/mindir_outputs/cpu` 和
 脚本面向 MindSpore Lite 2.0+。同一个 MindIR 只有在它本身跨设备兼容时才能直接在
 CPU 和 Ascend 上复用，例如原始 MindIR 或 `converter_lite --optimize=none` 的产物。
 `--optimize=general` 的离线优化模型仅用于 CPU，`--optimize=ascend_oriented` 的产物
-仅用于 Ascend。后一种场景应先用 CPU 兼容模型生成 fixture，再在两次 benchmark 中
-分别通过 `--model` 指定 CPU/Ascend 模型；两份模型的输入数量、顺序、名称、shape 和
-dtype 必须完全一致。生成器自身通过 CPU 推进 MindIR state，不能加载仅支持 Ascend
-的模型。
+仅用于 Ascend。对于后一种产物，可以用生成器的 `--mindir-device ascend` 直接生成
+NPU-native state fixture，也可以用 CPU 兼容模型生成 fixture；随后在 CPU/Ascend 两次
+benchmark 中分别通过 `--model` 指向各自模型。两份模型的输入数量、顺序、名称、shape
+和 dtype 必须完全一致。直接用 Ascend 模型生成时，manifest 中的默认模型也仅能在
+Ascend 运行；CPU benchmark 必须用 `--model` 覆盖为 CPU 模型。
 
 Ascend benchmark 的 `--ascend-precision-mode` 应与 `converter_lite` 转换模型时的
 `precision_mode` 保持一致。如果转换时未显式设置，Converter 默认为
