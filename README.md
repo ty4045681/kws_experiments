@@ -46,6 +46,7 @@ kws_experiments/
 │   ├── bench_zipformer_streaming_mindir.py # MindSpore Lite 流式 encoder 前向基准
 │   ├── generate_zipformer_streaming_fixtures.py # 流式 encoder CLI 输入生成
 │   ├── bench_zipformer_streaming_onnx_fixtures.py # 基于 fixture 的 ONNX Python API 测试
+│   ├── bench_zipformer_streaming_mindir_fixtures.py # fixture 的 MindIR CPU/Ascend 测试
 │   └── report.ipynb           # 分析 / 可视化模板
 ├── sherpa_eval/               # sherpa-onnx 评测端(独立可跑)
 │   ├── run.sh                 # 多 testset 循环:build_manifest + eval
@@ -307,12 +308,12 @@ I/O Binding 下 state 常驻 NPU 的收益。
 encoder 输入 shape 中的 `T`；若时间维是动态的，必须通过 `--input-frames` 指定。
 `--chunk-size` 仍须与模型导出配置一致，并决定每步前移的 fbank 帧数。
 
-### 生成 native CLI 输入 fixture
+### 生成 streaming 输入 fixture
 
 `scripts/generate_zipformer_streaming_fixtures.py` 仅离线生成固定模型输入，
-不调用或适配 ONNX Runtime / MindSpore Lite 的 benchmark CLI。它以 Python API
-推进真实 state，并将每个 step 的完整输入按模型定义顺序写成 raw `.bin` 文件；
-后续可由本机版本对应的 CLI 工具自行加载。
+不调用 benchmark CLI。它以 Python API 推进真实 state，并将每个 step 的
+完整输入按模型定义顺序写成 raw `.bin` 文件；后续可由本仓库的 fixture
+benchmark 脚本或本机版本对应的 CLI 工具加载。
 
 fixture 数量由 `ceil(left_context_frames / chunk_size) + 1` 决定。例如默认
 `chunk_size=16`、`left_context_frames=64` 时生成 5 组：`step_00_initial`、
@@ -342,21 +343,38 @@ shape 读取；动态时间维模型需传 `--input-frames`。`shift_frames` 始
 `2 * chunk_size`，并与 `input_frames` 分别记录在 manifest。输出目录默认必须为空；
 需要复用目录时显式传入 `--overwrite`。
 
-### 基于 fixture 的 ONNX Python API 测试
+### 基于 fixture 的 Python API 测试
 
-MindIR fixture 仍按上文用 MindSpore Lite `benchmark` CLI 测试。ONNX 侧则由
-`scripts/bench_zipformer_streaming_onnx_fixtures.py` 用 ONNX Runtime Python API
-直接加载 fixture：脚本读取 `manifest.json` 中 `backends.onnx` 的每个 step，从
-raw `.bin` 还原完整输入 feed（feature + cache state），逐 step 做
-warmup(默认 20) + 计时循环(默认 100)，只测量 `session.run()`，报告
-mean/std/min/p50/p90/p95/p99/max。计时结束后额外跑一次推理，把该 step 的全部
-输出写成 `output_<index>_<name>.bin`，并生成 `outputs_manifest.json`
-（含 dtype/shape/byte size 与每步延迟统计），可用于和 MindIR benchmark 的输出
-做数值精度对比。
+`scripts/bench_zipformer_streaming_onnx_fixtures.py` 和
+`scripts/bench_zipformer_streaming_mindir_fixtures.py` 分别读取 `manifest.json` 中
+`backends.onnx` 和 `backends.mindir` 的每个 step，从 raw `.bin` 还原完整输入
+feed（feature + cache state）。每个 fixture 都是生成时刻的完整、独立状态快照；
+benchmark 对每个 step 独立 warmup 和计时，不会把 `new_*` 输出回填到下一个
+step。因此对比的是“相同输入快照下的单步 forward”，不是各 backend 独立连续
+运行时的长期 state 漂移。
+
+两个脚本默认逐 step 做 warmup 20 次和计时 100 次，只测量
+`session.run()` 或 `model.predict()`，报告 mean/std/min/p50/p90/p95/p99/max。
+计时结束后额外跑一次推理，把该 step 的全部输出写成
+`output_<index>_<name>.bin`，并生成包含 dtype/shape/byte size 与延迟统计的
+`outputs_manifest.json`，可用于 ONNX、MindIR CPU 和 MindIR Ascend 之间的
+数值精度对比。
 
 ```bash
 uv run --with onnxruntime python scripts/bench_zipformer_streaming_onnx_fixtures.py \
   --fixtures-dir fixtures/zipformer-onnx
+
+# MindIR CPU
+uv run python scripts/bench_zipformer_streaming_mindir_fixtures.py \
+  --fixtures-dir fixtures/zipformer-both \
+  --device cpu
+
+# MindIR Ascend NPU
+uv run python scripts/bench_zipformer_streaming_mindir_fixtures.py \
+  --fixtures-dir fixtures/zipformer-both \
+  --device ascend \
+  --device-id 0 \
+  --ascend-precision-mode enforce_fp16
 ```
 
 模型路径默认取 manifest 中记录的 ONNX 模型，可用 `--model` 覆盖。输出默认写到
@@ -364,6 +382,37 @@ uv run --with onnxruntime python scripts/bench_zipformer_streaming_onnx_fixtures
 CANN 参数与 `bench_zipformer_streaming_onnx.py` 一致；`outputs_manifest.json` 的
 `configuration` 会记录 ONNX Runtime 版本、请求/实际 Provider、CANN options 和
 CPU fallback 状态。
+
+MindIR 模型路径同样默认取 manifest，可用 `--model` 覆盖。CPU 和
+Ascend 输出分别默认写到 `<fixtures-dir>/mindir_outputs/cpu` 和
+`<fixtures-dir>/mindir_outputs/ascend`（也可用 `--output-dir` 覆盖；非空时需
+`--overwrite`）。`outputs_manifest.json` 会记录 MindSpore Lite 版本、设备、线程、
+绑核和请求的 Ascend precision mode 等配置。
+
+脚本面向 MindSpore Lite 2.0+。同一个 MindIR 只有在它本身跨设备兼容时才能直接在
+CPU 和 Ascend 上复用，例如原始 MindIR 或 `converter_lite --optimize=none` 的产物。
+`--optimize=general` 的离线优化模型仅用于 CPU，`--optimize=ascend_oriented` 的产物
+仅用于 Ascend。后一种场景应先用 CPU 兼容模型生成 fixture，再在两次 benchmark 中
+分别通过 `--model` 指定 CPU/Ascend 模型；两份模型的输入数量、顺序、名称、shape 和
+dtype 必须完全一致。生成器自身通过 CPU 推进 MindIR state，不能加载仅支持 Ascend
+的模型。
+
+Ascend benchmark 的 `--ascend-precision-mode` 应与 `converter_lite` 转换模型时的
+`precision_mode` 保持一致。如果转换时未显式设置，Converter 默认为
+`enforce_fp16`，benchmark 时应显式传入
+`--ascend-precision-mode enforce_fp16`。要测量 FP32，应使用
+`precision_mode=enforce_fp32` 重新转换模型，并在 benchmark 时传入相同值；
+不应试图用运行时参数逆转已在转换期发生的 FP16 化。
+
+动态输入在 Ascend 上还受转换或在线编译时配置的 shape gear 约束。fixture shape 必须
+属于模型已允许的范围；在线编译场景可通过 benchmark 的 `--config-path` 传入包含
+`[ascend_context]`、`input_shape` 和 `dynamic_dims` 的 MindSpore Lite 配置。单独调用
+`model.resize()` 不会创造新的 Ascend dynamic gear。使用 `--ascend-provider ge` 时，
+应改用与 GE 后端匹配的 graph options（如 `ge.inputShape` / `ge.dynamicDims`）。
+
+MindSpore Lite 的 Ascend target 可使用 CPU 执行部分不支持的算子，所以“模型
+运行成功”不证明全图已下沉 NPU。正式性能结论前需结合 Ascend profiling 或
+runtime 日志确认实际算子归属；profiling 会扰动时延，该次结果不应当作基准数据。
 
 ## sherpa-onnx 端
 

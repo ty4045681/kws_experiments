@@ -134,8 +134,13 @@ def input_entry(index: int, name: str, array: np.ndarray, path: Path, root: Path
 def prepared_features(args: argparse.Namespace, fixture_count: int) -> List[np.ndarray]:
     shift_frames = 2 * args.chunk_size
     total_frames = args.input_frames + (fixture_count - 1) * shift_frames
-    stream = np.random.default_rng(args.seed).standard_normal((total_frames, args.feature_dim), dtype=np.float32)
-    return [np.ascontiguousarray(stream[step * shift_frames:step * shift_frames + args.input_frames][None]) for step in range(fixture_count)]
+    generator = np.random.default_rng(args.seed)
+    if args.batch_size == 1:
+        # Preserve the exact random values produced by earlier fixture versions.
+        stream = generator.standard_normal((total_frames, args.feature_dim), dtype=np.float32)[None]
+    else:
+        stream = generator.standard_normal((args.batch_size, total_frames, args.feature_dim), dtype=np.float32)
+    return [np.ascontiguousarray(stream[:, step * shift_frames:step * shift_frames + args.input_frames]) for step in range(fixture_count)]
 
 
 def write_feature_windows(output_dir: Path, features: Sequence[np.ndarray], args: argparse.Namespace, fill_steps: int) -> List[str]:
@@ -190,11 +195,26 @@ def onnx_initial_feed(session: Any, args: argparse.Namespace) -> Dict[str, np.nd
 def onnx_state_mapping(session: Any) -> List[Tuple[str, int]]:
     inputs = session.get_inputs()
     outputs = session.get_outputs()
-    input_names = {meta.name for meta in inputs}
-    mapping = [(meta.name.removeprefix("new_"), index) for index, meta in enumerate(outputs) if meta.name.startswith("new_") and meta.name.removeprefix("new_") in input_names]
-    if mapping:
-        return mapping
     state_inputs = [meta for meta in inputs if not is_feature_input(meta.name) and not is_length_input(meta.name)]
+    state_names = [meta.name for meta in state_inputs]
+    state_name_set = set(state_names)
+    mapping = [(meta.name.removeprefix("new_"), index) for index, meta in enumerate(outputs) if meta.name.startswith("new_") and meta.name.removeprefix("new_") in state_name_set]
+    if mapping:
+        mapped_names = [name for name, _ in mapping]
+        missing = [name for name in state_names if name not in mapped_names]
+        duplicates = sorted({name for name in mapped_names if mapped_names.count(name) > 1})
+        if missing or duplicates:
+            details = []
+            if missing:
+                details.append(f"missing state outputs for {missing}")
+            if duplicates:
+                details.append(f"duplicate state outputs for {duplicates}")
+            raise ValueError(
+                "Incomplete ONNX new_* state mapping: "
+                + "; ".join(details)
+                + ". Every state input must have exactly one matching new_<input> output."
+            )
+        return mapping
     state_outputs = outputs[1:]
     if len(state_inputs) != len(state_outputs):
         raise ValueError("Could not map ONNX output states by name or output order.")
@@ -337,11 +357,25 @@ def mindir_reset_states(inputs: Sequence[object], feature_index: int, args: argp
 
 
 def mindir_state_mapping(inputs: Sequence[object], outputs: Sequence[object]) -> List[Tuple[int, int]]:
-    indexes = {tensor.name: index for index, tensor in enumerate(inputs)}
-    mapping = [(indexes[tensor.name.removeprefix("new_")], output_index) for output_index, tensor in enumerate(outputs) if tensor.name.startswith("new_") and tensor.name.removeprefix("new_") in indexes]
-    if mapping:
-        return mapping
     state_indexes = [index for index, tensor in enumerate(inputs) if not is_feature_input(tensor.name) and not is_length_input(tensor.name)]
+    state_indexes_by_name = {inputs[index].name: index for index in state_indexes}
+    mapping = [(state_indexes_by_name[tensor.name.removeprefix("new_")], output_index) for output_index, tensor in enumerate(outputs) if tensor.name.startswith("new_") and tensor.name.removeprefix("new_") in state_indexes_by_name]
+    if mapping:
+        mapped_names = [inputs[input_index].name for input_index, _ in mapping]
+        missing = [inputs[index].name for index in state_indexes if inputs[index].name not in mapped_names]
+        duplicates = sorted({name for name in mapped_names if mapped_names.count(name) > 1})
+        if missing or duplicates:
+            details = []
+            if missing:
+                details.append(f"missing state outputs for {missing}")
+            if duplicates:
+                details.append(f"duplicate state outputs for {duplicates}")
+            raise ValueError(
+                "Incomplete MindIR new_* state mapping: "
+                + "; ".join(details)
+                + ". Every state input must have exactly one matching new_<input> output."
+            )
+        return mapping
     state_outputs = outputs[1:]
     if len(state_indexes) != len(state_outputs):
         raise ValueError("Could not map MindIR output states by name or output order.")
