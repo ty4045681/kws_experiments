@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Benchmark a stateful streaming Zipformer MindIR encoder with MindSpore Lite.
+"""Benchmark a stateful streaming Zipformer MindIR encoder on CPU or Ascend.
 
-Example:
+Examples:
     python scripts/bench_zipformer_streaming_mindir.py \
         --model path/to/encoder.mindir
+
+    python scripts/bench_zipformer_streaming_mindir.py \
+        --model path/to/encoder.mindir --device ascend --device-id 0 \
+        --ascend-precision-mode enforce_fp16
+
+    python scripts/bench_zipformer_streaming_mindir.py \
+        --model path/to/encoder.mindir --device npu --profile
 """
 
 from __future__ import annotations
@@ -11,17 +18,27 @@ from __future__ import annotations
 import argparse
 import os
 import platform
+import shlex
+import shutil
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 
 FEATURE_INPUT_NAMES = {"x", "features", "feature", "feats"}
 LENGTH_INPUT_NAMES = {"x_lens", "lengths", "lens"}
+ASCEND_PRECISION_MODES = (
+    "enforce_fp32",
+    "preferred_fp32",
+    "enforce_fp16",
+    "enforce_origin",
+    "preferred_optimal",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,23 +51,98 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--left-context-frames", type=int, default=64, help="Left context at 50 fps. Default: 64.")
     parser.add_argument("--warmup", type=int, default=20, help="Number of stateful warmup calls. Default: 20.")
     parser.add_argument("--loops", type=int, default=100, help="Number of stateful benchmark calls. Default: 100.")
-    parser.add_argument("--threads", type=int, default=1, help="MindSpore Lite CPU thread count. Default: 1.")
-    parser.add_argument("--cpu", type=int, default=0, help="CPU core to bind on Linux. Default: 0.")
-    parser.add_argument("--no-cpu-bind", action="store_true", help="Do not bind the process to a CPU core.")
-    parser.add_argument("--enable-fp16", action="store_true", help="Enable MindSpore Lite CPU FP16 mode.")
+    parser.add_argument(
+        "--device",
+        choices=("cpu", "ascend", "npu"),
+        default="cpu",
+        help="Inference device; npu is an alias for ascend. Default: cpu.",
+    )
+    parser.add_argument("--device-id", type=int, default=0, help="Ascend device ID. Default: 0.")
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=1,
+        help="CPU thread count, including Ascend CPU fallback. Default: 1.",
+    )
+    parser.add_argument(
+        "--enable-fp16",
+        action="store_true",
+        help="Prefer FP16 for CPU inference. Not valid for Ascend.",
+    )
+    parser.add_argument(
+        "--ascend-precision-mode",
+        choices=ASCEND_PRECISION_MODES,
+        help=(
+            "Ascend runtime precision mode. Keep it consistent with converter_lite; "
+            "omitting this option leaves the runtime default unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--ascend-provider",
+        choices=("default", "ge"),
+        default="default",
+        help="Ascend provider. Default leaves the MindSpore Lite provider unchanged.",
+    )
+    parser.add_argument(
+        "--config-path",
+        help=(
+            "Optional MindSpore Lite build configuration. Ascend dynamic inputs "
+            "must declare supported shape gears in a backend-compatible config."
+        ),
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Collect an Ascend profile by launching this benchmark under msprof.",
+    )
+    parser.add_argument(
+        "--profile-output",
+        default=f"profiles/{Path(__file__).stem}",
+        help="msprof output directory. Used only with --profile.",
+    )
+    parser.add_argument(
+        "--msprof-path",
+        default="msprof",
+        help="msprof executable name or path. Used only with --profile.",
+    )
+    parser.add_argument("--profile-child", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--cpu", type=int, default=0, help="Host CPU core to bind on Linux. Default: 0.")
+    parser.add_argument("--no-cpu-bind", action="store_true", help="Do not bind the process to a host CPU core.")
     parser.add_argument("--seed", type=int, default=42, help="Random feature seed. Default: 42.")
     return parser.parse_args()
 
 
+def normalize_device(device: str) -> str:
+    return "ascend" if device == "npu" else device
+
+
 def validate_args(args: argparse.Namespace) -> None:
+    args.device = normalize_device(args.device)
     if args.batch_size < 1 or args.feature_dim < 1 or args.chunk_size < 1:
         raise ValueError("batch-size, feature-dim, and chunk-size must be positive.")
     if args.input_frames is not None and args.input_frames < 1:
         raise ValueError("input-frames must be positive when provided.")
     if args.left_context_frames < 0 or args.warmup < 0 or args.loops < 1:
         raise ValueError("left-context-frames and warmup must be non-negative; loops must be positive.")
-    if args.threads < 1 or args.cpu < 0:
-        raise ValueError("threads must be positive and cpu must be non-negative.")
+    if args.threads < 1 or args.cpu < 0 or args.device_id < 0:
+        raise ValueError("threads must be positive; cpu and device-id must be non-negative.")
+    if args.device == "cpu":
+        if args.ascend_precision_mode is not None:
+            raise ValueError("--ascend-precision-mode requires --device ascend.")
+        if args.ascend_provider != "default":
+            raise ValueError("--ascend-provider requires --device ascend.")
+        if args.profile:
+            raise ValueError("--profile requires --device ascend or --device npu.")
+    elif args.enable_fp16:
+        raise ValueError(
+            "--enable-fp16 is CPU-only; use --ascend-precision-mode for Ascend."
+        )
+    if args.config_path and not Path(args.config_path).expanduser().is_file():
+        raise FileNotFoundError(
+            f"MindSpore Lite config file does not exist: {args.config_path}"
+        )
+    if args.profile and not args.profile_output:
+        raise ValueError("--profile-output must not be empty when --profile is enabled.")
 
 
 def bind_cpu(cpu: int) -> None:
@@ -62,6 +154,133 @@ def bind_cpu(cpu: int) -> None:
         print(f"[info] Bound process to CPU {cpu}.")
     except OSError as error:
         print(f"[warning] Could not bind process to CPU {cpu}: {error}", file=sys.stderr)
+
+
+def set_cpu_precision(cpu_context: Any, enable_fp16: bool) -> str:
+    precision_mode = "preferred_fp16" if enable_fp16 else "enforce_fp32"
+    if hasattr(cpu_context, "precision_mode"):
+        try:
+            cpu_context.precision_mode = precision_mode
+            return precision_mode
+        except (AttributeError, RuntimeError, ValueError):
+            pass
+    if hasattr(cpu_context, "enable_fp16"):
+        cpu_context.enable_fp16 = enable_fp16
+        return precision_mode
+    raise RuntimeError("This MindSpore Lite Context exposes no CPU precision setting.")
+
+
+def create_context(mslite: Any, args: argparse.Namespace) -> Tuple[Any, Dict[str, Any]]:
+    context = mslite.Context()
+    context.cpu.thread_num = args.threads
+    cpu_precision_mode = set_cpu_precision(
+        context.cpu, args.enable_fp16 if args.device == "cpu" else False
+    )
+    context.target = [args.device]
+
+    context_precision = None
+    context_provider = None
+    if args.device == "ascend":
+        context.ascend.device_id = args.device_id
+        if args.ascend_precision_mode is not None:
+            context.ascend.precision_mode = args.ascend_precision_mode
+        else:
+            print(
+                "[warning] --ascend-precision-mode was not specified; the MindSpore "
+                "Lite runtime default is left unchanged. For reproducible results, pass "
+                "the mode used by converter_lite (its default is enforce_fp16).",
+                file=sys.stderr,
+            )
+        if args.ascend_provider == "ge":
+            context.ascend.provider = "ge"
+        context_precision = getattr(context.ascend, "precision_mode", None)
+        context_provider = getattr(context.ascend, "provider", None)
+
+    metadata = {
+        "device": args.device,
+        "target": list(getattr(context, "target", [args.device])),
+        "device_id": args.device_id if args.device == "ascend" else None,
+        "cpu_precision_mode": cpu_precision_mode,
+        "requested_ascend_precision_mode": args.ascend_precision_mode,
+        "context_ascend_precision_mode": context_precision,
+        "requested_ascend_provider": args.ascend_provider,
+        "context_ascend_provider": context_provider,
+        "cpu_fallback_enabled": args.device == "ascend",
+    }
+    return context, metadata
+
+
+def build_model(
+    mslite: Any, model_path: Path, context: Any, config_path: Optional[str]
+) -> Any:
+    model = mslite.Model()
+    if config_path:
+        model.build_from_file(
+            str(model_path),
+            mslite.ModelType.MINDIR,
+            context,
+            str(Path(config_path).expanduser().resolve()),
+        )
+    else:
+        model.build_from_file(str(model_path), mslite.ModelType.MINDIR, context)
+    return model
+
+
+def resolve_msprof_executable(value: str) -> str:
+    candidate = str(Path(value).expanduser()) if os.sep in value else value
+    executable = shutil.which(candidate)
+    if executable is None:
+        raise FileNotFoundError(
+            f"msprof executable was not found: {value}. Source the CANN set_env.sh "
+            "script or pass --msprof-path."
+        )
+    return str(Path(executable).resolve())
+
+
+def create_msprof_command(
+    args: argparse.Namespace,
+    model_path: Path,
+    config_path: Optional[str],
+    argv: Optional[Sequence[str]] = None,
+) -> Tuple[List[str], Path]:
+    executable = resolve_msprof_executable(args.msprof_path)
+    output_dir = Path(args.profile_output).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    child_args = list(sys.argv[1:] if argv is None else argv)
+    child_command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        *child_args,
+        "--model",
+        str(model_path),
+        "--profile-child",
+    ]
+    if config_path:
+        child_command.extend(
+            ["--config-path", str(Path(config_path).expanduser().resolve())]
+        )
+    application = shlex.join(child_command)
+    return [
+        executable,
+        f"--application={application}",
+        f"--output={output_dir}",
+    ], output_dir
+
+
+def run_with_msprof(
+    args: argparse.Namespace, model_path: Path, config_path: Optional[str]
+) -> int:
+    command, output_dir = create_msprof_command(args, model_path, config_path)
+    print(f"[info] Launching Ascend profiling with msprof; output={output_dir}")
+    print(
+        "[warning] Profiling adds overhead; do not use this run as the baseline "
+        "latency result.",
+        file=sys.stderr,
+    )
+    completed = subprocess.run(command, check=False)
+    if completed.returncode == 0:
+        print(f"[info] Ascend profile data written under: {output_dir}")
+    return completed.returncode
 
 
 def is_feature_input(name: str) -> bool:
@@ -230,30 +449,56 @@ def main() -> None:
     args = parse_args()
     try:
         validate_args(args)
-        if not Path(args.model).is_file():
-            raise FileNotFoundError(f"Model file does not exist: {args.model}")
+        model_path = Path(args.model).expanduser().resolve()
+        if not model_path.is_file():
+            raise FileNotFoundError(f"Model file does not exist: {model_path}")
+        config_path = (
+            str(Path(args.config_path).expanduser().resolve())
+            if args.config_path
+            else None
+        )
+        if args.profile and not args.profile_child:
+            raise SystemExit(run_with_msprof(args, model_path, config_path))
         if not args.no_cpu_bind:
             bind_cpu(args.cpu)
         os.environ.setdefault("OMP_NUM_THREADS", str(args.threads))
         os.environ.setdefault("MKL_NUM_THREADS", str(args.threads))
         import mindspore_lite as mslite
 
-        context = mslite.Context()
-        context.target = ["cpu"]
-        context.cpu.thread_num = args.threads
-        context.cpu.enable_fp16 = args.enable_fp16
-        model = mslite.Model()
-        model.build_from_file(args.model, mslite.ModelType.MINDIR, context)
+        context, context_metadata = create_context(mslite, args)
+        model = build_model(mslite, model_path, context, config_path)
         inputs = list(model.get_inputs())
         feature_index = get_feature_index(inputs)
         args.input_frames = resolve_input_frames(inputs[feature_index].shape, args.input_frames)
         inputs = resize_dynamic_inputs(model, inputs, args)
         feature_index = get_feature_index(inputs)
         input_frames = check_model_layout(inputs, feature_index, args)
+        print(f"[info] Model: {model_path}")
         print("[info] Model inputs:")
         for tensor in inputs:
             print(f"  {tensor.name}: shape={tensor.shape}, type={tensor.dtype}")
-        print(f"[info] input_frames={input_frames}, chunk_size={args.chunk_size}, left_context_frames={args.left_context_frames}, warmup={args.warmup}, loops={args.loops}, threads={args.threads}, enable_fp16={args.enable_fp16}")
+        print(
+            f"[info] device={args.device}, input_frames={input_frames}, "
+            f"chunk_size={args.chunk_size}, left_context_frames={args.left_context_frames}, "
+            f"warmup={args.warmup}, loops={args.loops}, threads={args.threads}, "
+            f"enable_fp16={args.enable_fp16}"
+        )
+        if args.device == "ascend":
+            print(
+                f"[info] device_id={context_metadata['device_id']}, "
+                f"ascend_precision_mode={context_metadata['context_ascend_precision_mode']}, "
+                f"ascend_provider={context_metadata['context_ascend_provider']}"
+            )
+            print(
+                "[warning] An Ascend target may retain CPU fallback for some nodes; "
+                "successful execution alone does not prove full NPU offload.",
+                file=sys.stderr,
+            )
+        if args.profile:
+            print(
+                f"[info] Ascend profiling is active; output root="
+                f"{Path(args.profile_output).expanduser().resolve()}"
+            )
 
         shift_frames = 2 * args.chunk_size
         total_frames = input_frames + (max(args.warmup, args.loops) - 1) * shift_frames
@@ -282,7 +527,7 @@ def main() -> None:
             update_states(inputs, outputs, state_mapping)
 
         print_summary(latencies_ms, args)
-    except (FileNotFoundError, ImportError, ValueError, RuntimeError) as error:
+    except (FileNotFoundError, ImportError, OSError, ValueError, RuntimeError) as error:
         print(f"[error] {error}", file=sys.stderr)
         raise SystemExit(1)
 

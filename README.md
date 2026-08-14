@@ -272,7 +272,28 @@ uv run --with onnxruntime python scripts/bench_zipformer_streaming_onnx.py \
 # MindSpore Lite: install the platform-matched mindspore_lite package first
 uv run python scripts/bench_zipformer_streaming_mindir.py \
   --model /path/to/encoder.mindir
+
+# MindSpore Lite Ascend（--device npu 等价于 --device ascend）
+uv run python scripts/bench_zipformer_streaming_mindir.py \
+  --model /path/to/encoder.mindir \
+  --device ascend \
+  --device-id 0 \
+  --ascend-precision-mode enforce_fp16
+
+# 使用 CANN msprof 采集 Ascend profile；该次时延不可作为基线
+uv run python scripts/bench_zipformer_streaming_mindir.py \
+  --model /path/to/encoder.mindir \
+  --device npu \
+  --ascend-precision-mode enforce_fp16 \
+  --profile \
+  --profile-output profiles/streaming-mindir
 ```
+
+MindIR benchmark 的 Ascend 参数与 fixture 路径一致：支持 `--device-id`、
+`--ascend-precision-mode`、`--ascend-provider` 和 `--config-path`。`--profile`
+仅用于 Ascend/NPU；脚本会用当前 Python 环境在 `msprof` 下重新启动自身，可通过
+`--msprof-path` 指定可执行文件。建议 profiling 时显式减小 `--warmup` 和 `--loops`，
+避免采集无关的重复迭代。
 
 三个 ONNX benchmark（`bench_zipformer_encoder_onnx.py`、
 `bench_zipformer_streaming_onnx.py` 和
